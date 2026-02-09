@@ -11,8 +11,8 @@ OpenAI-compatible REST API (TTS/STT) 를 제공한다.
 
 ## Toolchain
 - **Language**: C++17
-- **Compiler**: clang-cl (LLVM/Clang MSVC 호환 드라이버)
-- **Linker**: lld-link
+- **Compiler**: MSVC (cl.exe)
+- **Linker**: link.exe
 - **Build System**: CMake
 - **Target OS**: Windows
 
@@ -39,7 +39,7 @@ OpenAI-compatible REST API (TTS/STT) 를 제공한다.
 2. 모델: `/mnt/USERS/onion/DATA_ORIGN/Workspace/VibeVoiceDockerApiServer/models/` 사용
 3. NVIDIA CUDA library 외 다른 것은 설치할 필요 없어야 함 (TensorRT는 NVIDIA 제품으로 허용)
 4. 필요한 파일은 현재 디렉터리로 복사
-5. clang-cl로 Windows 빌드
+5. MSVC (cl.exe)로 Windows 빌드
 
 ## Development Plan
 상세 개발 계획은 `DEVPLAN.md` 참조.

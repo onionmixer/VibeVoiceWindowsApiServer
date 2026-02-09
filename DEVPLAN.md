@@ -7,7 +7,7 @@ Docker 기반 Python VibeVoice API 서버를 **Windows Native C++ Standalone 서
 NVIDIA CUDA/TensorRT만을 외부 의존성으로 사용하며, OpenAI-compatible REST API를 제공한다.
 
 ### 1.2 Toolchain
-- **Compiler**: clang-cl (LLVM/Clang의 MSVC 호환 드라이버)
+- **Compiler**: MSVC (cl.exe)
 - **Build System**: CMake
 - **GPU Inference**: NVIDIA TensorRT
 - **GPU Runtime**: CUDA Toolkit (cuBLAS, cuDNN, cudart)
@@ -374,17 +374,17 @@ public:
 
 ---
 
-## 6. Build System (clang-cl + CMake)
+## 6. Build System (MSVC + CMake)
 
 ### 6.1 Toolchain
 
 | Tool | Version | Role |
 |------|---------|------|
-| **clang-cl** | >= 17 | C++ 컴파일 (MSVC ABI 호환) |
+| **MSVC (cl.exe)** | VS 2019+ | C++ 컴파일 |
 | **CMake** | >= 3.20 | 빌드 설정 + 빌드 백엔드 |
 | **nvcc** | CUDA 12.x | .cu 파일 컴파일 (필요 시) |
 
-clang-cl은 MSVC ABI를 그대로 사용하므로 TensorRT/CUDA 라이브러리(.lib)와 직접 링크 가능하다.
+MSVC는 TensorRT/CUDA 라이브러리(.lib)와 네이티브로 링크 가능하다.
 `.cu` 파일이 필요한 경우 nvcc로 분리 컴파일 후 링크한다.
 
 ### 6.2 CMakeLists.txt
@@ -396,13 +396,9 @@ project(VibeVoiceServer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── clang-cl 설정 ──
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
-    add_compile_options(
-        /W4
-        -Wno-unused-parameter
-        -fcolor-diagnostics
-    )
+# ── MSVC 설정 ──
+if(MSVC)
+    add_compile_options(/W4 /MP)
 endif()
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 
@@ -450,27 +446,23 @@ install(TARGETS vibevoice_server RUNTIME DESTINATION bin)
     "configurePresets": [
         {
             "name": "release",
-            "displayName": "clang-cl Release",
-            "generator": "NMake Makefiles",
+            "displayName": "MSVC Release",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64" },
             "binaryDir": "${sourceDir}/build/release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_C_COMPILER": "clang-cl",
-                "CMAKE_CXX_COMPILER": "clang-cl",
-                "CMAKE_LINKER": "lld-link",
                 "TENSORRT_ROOT": "$env{TENSORRT_ROOT}"
             }
         },
         {
             "name": "debug",
-            "displayName": "clang-cl Debug",
-            "generator": "NMake Makefiles",
+            "displayName": "MSVC Debug",
+            "generator": "Visual Studio 17 2022",
+            "architecture": { "value": "x64" },
             "binaryDir": "${sourceDir}/build/debug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_C_COMPILER": "clang-cl",
-                "CMAKE_CXX_COMPILER": "clang-cl",
-                "CMAKE_LINKER": "lld-link",
                 "TENSORRT_ROOT": "$env{TENSORRT_ROOT}"
             }
         }
@@ -504,15 +496,14 @@ cmake --build --preset release
 build\release\vibevoice_server.exe --config config.json
 ```
 
-### 6.5 clang-cl 호환성
+### 6.5 MSVC 호환성
 
 | 대상 | 호환성 |
 |------|--------|
-| MSVC CRT/STL headers | clang-cl이 네이티브 지원 |
-| TensorRT C++ API (.lib) | MSVC ABI → 직접 링크 가능 |
-| CUDA Runtime (.lib) | MSVC ABI → 직접 링크 가능 |
-| cuBLAS/cuDNN (.lib) | MSVC ABI → 직접 링크 가능 |
-| .cu device code | nvcc로 별도 컴파일, .obj를 lld-link로 링크 |
+| TensorRT C++ API (.lib) | 네이티브 링크 |
+| CUDA Runtime (.lib) | 네이티브 링크 |
+| cuBLAS/cuDNN (.lib) | 네이티브 링크 |
+| .cu device code | nvcc가 MSVC host compiler 사용 |
 | Windows API (ws2_32 등) | 완전 호환 |
 
 ---
@@ -523,7 +514,7 @@ build\release\vibevoice_server.exe --config config.json
 - [ ] CMakeLists.txt + CMakePresets.json
 - [ ] third_party/ 다운로드 (cpp-httplib, nlohmann/json, dr_libs)
 - [ ] 디렉터리 구조 생성
-- [ ] clang-cl + TensorRT + CUDA 링크 확인 (빌드 테스트)
+- [ ] MSVC + TensorRT + CUDA 링크 확인 (빌드 테스트)
 - [ ] main.cpp 스켈레톤
 
 ### Phase 1: Model Conversion Pipeline (3-5일)
@@ -583,7 +574,7 @@ build\release\vibevoice_server.exe --config config.json
 - [ ] Logging
 
 ### Phase 7: 패키징 (1-2일)
-- [ ] Release 빌드 (/O2, LTO via lld-link)
+- [ ] Release 빌드 (/O2, LTCG)
 - [ ] 배포 패키지 (exe + engines + tokenizer + voices + ffmpeg)
 - [ ] 실행 가이드
 
@@ -598,7 +589,7 @@ build\release\vibevoice_server.exe --config config.json
 | **BPE 정확도** | tokenizer.json 직접 파싱, Python output 비교 테스트 |
 | **FP16 수치 차이** | Critical path FP32 유지, tolerance 검증 |
 | **ASR 7B 메모리 (~16GB)** | 모듈별 선택 로딩, INT8 양자화 옵션 |
-| **clang-cl + nvcc 공존** | .cu는 nvcc로 분리 컴파일, host code는 clang-cl 전담 |
+| **MSVC + nvcc 공존** | .cu는 nvcc로 컴파일 (MSVC를 host compiler로 사용) |
 
 ---
 
