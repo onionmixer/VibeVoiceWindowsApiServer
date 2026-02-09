@@ -13,8 +13,8 @@ models/
 # Voice presets (generated)
 voices/
 
-# Tokenizer files (downloaded)
-tokenizer/
+# Tokenizer files (downloaded, root-level only)
+/tokenizer/
 
 # Tools (ffmpeg binary)
 tools/ffmpeg.exe
