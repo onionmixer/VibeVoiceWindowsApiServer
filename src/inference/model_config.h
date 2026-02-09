@@ -98,5 +98,15 @@ struct VoicePreset {
 
 bool loadVoicePreset(const std::string& binPath, VoicePreset& out);
 
+// TTSInputTypes embedding (0.5B only): 2 x hidden_size fp16
+// Same binary format as EmbeddingWeights: header(u32 num=2, u32 dim=896) + fp16 data
+struct TTSInputTypesWeights {
+    uint32_t num_types = 0;       // = 2
+    uint32_t embedding_dim = 0;   // = hidden_size
+    std::vector<uint16_t> data;   // [2, hidden_size] fp16
+};
+
+bool loadTTSInputTypesWeights(const std::string& binPath, TTSInputTypesWeights& out);
+
 // Scalar (single fp32 value, 4 bytes)
 bool loadScalar(const std::string& binPath, float& out);

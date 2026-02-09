@@ -210,6 +210,18 @@ bool loadVoicePreset(const std::string& binPath, VoicePreset& out) {
     return true;
 }
 
+// ── TTSInputTypesWeights ──
+
+bool loadTTSInputTypesWeights(const std::string& binPath, TTSInputTypesWeights& out) {
+    // Reuses EmbeddingWeights binary format
+    EmbeddingWeights emb;
+    if (!loadEmbeddingWeights(binPath, emb)) return false;
+    out.num_types = emb.num_embeddings;
+    out.embedding_dim = emb.embedding_dim;
+    out.data = std::move(emb.data);
+    return true;
+}
+
 // ── Scalar ──
 
 bool loadScalar(const std::string& binPath, float& out) {

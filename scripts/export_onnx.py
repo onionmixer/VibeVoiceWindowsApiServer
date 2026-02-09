@@ -132,7 +132,7 @@ def _build_kv_cache(past_kv_flat, num_layers):
 class LMPrefillWrapper(nn.Module):
     """Wraps Qwen2ForCausalLM-style model for prefill (no KV-cache input).
     Input: inputs_embeds [B, S, H], position_ids [B, S]
-    Output: logits [B, S, V], kv_cache (list of key/value tensors)
+    Output: logits [B, S, V], hidden_states [B, S, H], kv_cache (list of key/value tensors)
     Used for models that have lm_head (1.5B TTS, ASR).
     """
     def __init__(self, language_model, lm_head):
@@ -149,13 +149,13 @@ class LMPrefillWrapper(nn.Module):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         kv_outputs = _extract_kv_cache(outputs.past_key_values)
-        return (logits,) + tuple(kv_outputs)
+        return (logits, hidden_states) + tuple(kv_outputs)
 
 
 class LMDecodeWrapper(nn.Module):
     """Wraps Qwen2ForCausalLM-style model for decode (with KV-cache).
     Input: inputs_embeds [B, 1, H], position_ids [B, 1], past KV tensors
-    Output: logits [B, 1, V], updated KV tensors
+    Output: logits [B, 1, V], hidden_states [B, 1, H], updated KV tensors
     Used for models that have lm_head (1.5B TTS, ASR).
     """
     def __init__(self, language_model, lm_head, num_layers, num_kv_heads, head_dim):
@@ -177,7 +177,7 @@ class LMDecodeWrapper(nn.Module):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         kv_outputs = _extract_kv_cache(outputs.past_key_values)
-        return (logits,) + tuple(kv_outputs)
+        return (logits, hidden_states) + tuple(kv_outputs)
 
 
 class LMHiddenPrefillWrapper(nn.Module):
@@ -596,11 +596,12 @@ def export_language_model_full(model, output_dir, model_type, config):
         (dummy_embeds, dummy_pos_ids),
         os.path.join(output_dir, "language_model_prefill.onnx"),
         input_names=["inputs_embeds", "position_ids"],
-        output_names=["logits"] + kv_out_names,
+        output_names=["logits", "hidden_states"] + kv_out_names,
         dynamic_axes={
             "inputs_embeds": {0: "batch", 1: "seq_len"},
             "position_ids": {0: "batch", 1: "seq_len"},
             "logits": {0: "batch", 1: "seq_len"},
+            "hidden_states": {0: "batch", 1: "seq_len"},
             **{name: {0: "batch", 2: "seq_len"} for name in kv_out_names},
         },
     )
@@ -630,11 +631,12 @@ def export_language_model_full(model, output_dir, model_type, config):
         decode_inputs,
         os.path.join(output_dir, "language_model_decode.onnx"),
         input_names=["inputs_embeds", "position_ids"] + kv_in_names,
-        output_names=["logits"] + kv_present_names,
+        output_names=["logits", "hidden_states"] + kv_present_names,
         dynamic_axes={
             "inputs_embeds": {0: "batch"},
             "position_ids": {0: "batch"},
             "logits": {0: "batch"},
+            "hidden_states": {0: "batch"},
             **{name: {0: "batch", 2: "past_seq_len"} for name in kv_in_names},
             **{name: {0: "batch", 2: "total_seq_len"} for name in kv_present_names},
         },

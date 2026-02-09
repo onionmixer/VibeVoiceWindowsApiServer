@@ -9,12 +9,12 @@ Binary format for streaming voices:
   Header (32 bytes):
     u32 magic          = 0x56425643 ("VBVC")
     u32 version        = 1
-    u32 num_groups     = 2 (lm, tts_lm)
+    u32 num_groups     = 4 (lm, tts_lm, neg_lm, neg_tts_lm)
     u32 hidden_size    = 896
     u32 head_dim       = 64
     u32 reserved[3]    = 0
 
-  For each group ("lm", "tts_lm"):
+  For each group ("lm", "tts_lm", "neg_lm", "neg_tts_lm"):
     Group header (16 bytes):
       u32 num_layers
       u32 num_kv_heads
@@ -57,7 +57,7 @@ def convert_streaming_voice(pt_path: str, bin_path: str) -> dict:
     data = torch.load(pt_path, map_location="cpu", weights_only=False)
 
     groups = []
-    group_names = ["lm", "tts_lm"]
+    group_names = ["lm", "tts_lm", "neg_lm", "neg_tts_lm"]
 
     for gname in group_names:
         if gname not in data:

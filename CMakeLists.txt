@@ -4,10 +4,7 @@ project(VibeVoiceServer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── MSVC settings ──
-if(MSVC)
-    add_compile_options(/W4 /MP)
-endif()
+# ── MSVC settings (CXX only, not CUDA) ──
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 
 # ── CUDA Toolkit ──
@@ -31,7 +28,7 @@ find_library(CUDNN_LIB cudnn
     HINTS ${CUDNN_ROOT} $ENV{CUDNN_ROOT} PATH_SUFFIXES lib lib/x64)
 
 # ── .cu files (optional) ──
-file(GLOB CUDA_SOURCES src/**/*.cu)
+file(GLOB_RECURSE CUDA_SOURCES src/*.cu)
 if(CUDA_SOURCES)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
@@ -41,6 +38,13 @@ endif()
 # ── Sources ──
 file(GLOB_RECURSE CXX_SOURCES src/*.cpp)
 add_executable(vibevoice_server ${CXX_SOURCES} ${CUDA_SOURCES})
+
+# MSVC warnings + parallel compile for C++ sources only
+if(MSVC)
+    target_compile_options(vibevoice_server PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4 /MP>
+    )
+endif()
 
 target_include_directories(vibevoice_server PRIVATE
     src

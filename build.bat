@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul 2>&1
-call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>&1
 
 set TENSORRT_ROOT=C:\Users\onion\Desktop\Workspace\TensorRT
 set CUDNN_ROOT=C:\Users\onion\Desktop\Workspace\cudnn
-set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
 
 cd /d "%~dp0"
 

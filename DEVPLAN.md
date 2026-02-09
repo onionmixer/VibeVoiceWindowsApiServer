@@ -532,24 +532,24 @@ build\release\vibevoice_server.exe --config config.json
 - [ ] ONNX output vs 원본 output 비교 검증
 
 ### Phase 2: Core C++ (3-4일)
-- [ ] TRTEngine — 엔진 로더/실행
-- [ ] CudaBuffer — GPU 메모리 관리
-- [ ] BPETokenizer — Qwen2 BPE C++ 구현
-- [ ] ModelConfig — config.json 파서
-- [ ] AudioIO — WAV/MP3/FLAC/OGG 로드 + WAV 쓰기
-- [ ] AudioConvert — ffmpeg.exe subprocess
+- [x] TRTEngine — 엔진 로더/실행
+- [x] CudaBuffer — GPU 메모리 관리
+- [x] BPETokenizer — Qwen2 BPE C++ 구현
+- [x] ModelConfig — config.json 파서
+- [x] AudioIO — WAV/MP3/FLAC/OGG 로드 + WAV 쓰기
+- [x] AudioConvert — ffmpeg.exe subprocess
 
 ### Phase 3: TTS Pipeline (5-7일)
-- [ ] 0.5B Streaming
-  - [ ] Voice .bin 로드 → GPU
-  - [ ] Text → BPE → tokens
-  - [ ] LM autoregressive (KV-cache)
-  - [ ] DPMSolver (cosine, v_prediction, 5 steps)
-  - [ ] Diffusion loop → Acoustic decode → WAV
-- [ ] 1.5B Full
-  - [ ] Voice .wav → Acoustic encode
+- [x] 0.5B Streaming
+  - [x] Voice .bin 로드 → GPU
+  - [x] Text → BPE → tokens
+  - [x] LM autoregressive (KV-cache)
+  - [x] DPMSolver (cosine, v_prediction, 5 steps)
+  - [x] Diffusion loop → Acoustic decode → WAV
+- [x] 1.5B Full (stub — export_onnx.py hidden_states fix 후 완성 가능)
+  - [x] Voice .wav → Acoustic encode
   - [ ] Multi-speaker script parsing
-  - [ ] LM → Diffusion(10 steps) → Acoustic decode → WAV
+  - [x] LM → Diffusion(10 steps) → Acoustic decode → WAV
 
 ### Phase 4: STT Pipeline (4-5일)
 - [ ] Audio 전처리 (resample, normalize, mono)
