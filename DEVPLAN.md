@@ -577,9 +577,9 @@ build\release\vibevoice_server.exe --config config.json
 - [x] E2E 테스트 (HTTP 엔드포인트 + 조건부 TRT 추론)
 
 ### Phase 7: 패키징 (1-2일)
-- [ ] Release 빌드 (/O2, LTCG)
-- [ ] 배포 패키지 (exe + engines + tokenizer + voices + ffmpeg)
-- [ ] 실행 가이드
+- [x] Release 빌드 (/O2, LTCG)
+- [x] 배포 패키지 (exe + engines + tokenizer + voices + ffmpeg)
+- [x] 실행 가이드
 
 ---
 

@@ -43,6 +43,10 @@ add_executable(vibevoice_server ${CXX_SOURCES} ${CUDA_SOURCES})
 if(MSVC)
     target_compile_options(vibevoice_server PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:/W4 /MP>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2 /Oi /Ot /GL /GS->
+    )
+    target_link_options(vibevoice_server PRIVATE
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
     )
 endif()
 
