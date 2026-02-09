@@ -13,7 +13,7 @@ OpenAI-compatible REST API (TTS/STT) 를 제공한다.
 - **Language**: C++17
 - **Compiler**: clang-cl (LLVM/Clang MSVC 호환 드라이버)
 - **Linker**: lld-link
-- **Build System**: CMake + Ninja
+- **Build System**: CMake
 - **Target OS**: Windows
 
 ## Dependencies

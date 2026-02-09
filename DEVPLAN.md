@@ -8,7 +8,7 @@ NVIDIA CUDA/TensorRT만을 외부 의존성으로 사용하며, OpenAI-compatibl
 
 ### 1.2 Toolchain
 - **Compiler**: clang-cl (LLVM/Clang의 MSVC 호환 드라이버)
-- **Build System**: CMake + Ninja
+- **Build System**: CMake
 - **GPU Inference**: NVIDIA TensorRT
 - **GPU Runtime**: CUDA Toolkit (cuBLAS, cuDNN, cudart)
 
@@ -374,15 +374,14 @@ public:
 
 ---
 
-## 6. Build System (clang-cl + Ninja)
+## 6. Build System (clang-cl + CMake)
 
 ### 6.1 Toolchain
 
 | Tool | Version | Role |
 |------|---------|------|
 | **clang-cl** | >= 17 | C++ 컴파일 (MSVC ABI 호환) |
-| **Ninja** | >= 1.11 | 빌드 백엔드 |
-| **CMake** | >= 3.20 | 빌드 설정 |
+| **CMake** | >= 3.20 | 빌드 설정 + 빌드 백엔드 |
 | **nvcc** | CUDA 12.x | .cu 파일 컴파일 (필요 시) |
 
 clang-cl은 MSVC ABI를 그대로 사용하므로 TensorRT/CUDA 라이브러리(.lib)와 직접 링크 가능하다.
@@ -452,7 +451,7 @@ install(TARGETS vibevoice_server RUNTIME DESTINATION bin)
         {
             "name": "release",
             "displayName": "clang-cl Release",
-            "generator": "Ninja",
+            "generator": "NMake Makefiles",
             "binaryDir": "${sourceDir}/build/release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
@@ -465,7 +464,7 @@ install(TARGETS vibevoice_server RUNTIME DESTINATION bin)
         {
             "name": "debug",
             "displayName": "clang-cl Debug",
-            "generator": "Ninja",
+            "generator": "NMake Makefiles",
             "binaryDir": "${sourceDir}/build/debug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
