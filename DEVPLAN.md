@@ -520,15 +520,15 @@ build\release\vibevoice_server.exe --config config.json
 - [x] main.cpp 스켈레톤
 
 ### Phase 1: Model Conversion Pipeline (3-5일)
-- [ ] `export_onnx.py` — 5개 서브모델 ONNX export
-  - [ ] Acoustic encoder
-  - [ ] Semantic encoder
-  - [ ] Language model (KV-cache)
-  - [ ] Diffusion head
-  - [ ] Acoustic decoder
-- [ ] `build_engines.py` — ONNX → TensorRT
-- [ ] `convert_voices.py` — .pt → .bin
-- [ ] `prepare_tokenizer.py` — Qwen2 tokenizer 준비
+- [x] `export_onnx.py` — 5개 서브모델 ONNX export
+  - [x] Acoustic encoder
+  - [x] Semantic encoder
+  - [x] Language model (KV-cache)
+  - [x] Diffusion head
+  - [x] Acoustic decoder
+- [x] `build_engines.py` — ONNX → TensorRT
+- [x] `convert_voices.py` — .pt → .bin
+- [x] `prepare_tokenizer.py` — Qwen2 tokenizer 준비
 - [ ] ONNX output vs 원본 output 비교 검증
 
 ### Phase 2: Core C++ (3-4일)

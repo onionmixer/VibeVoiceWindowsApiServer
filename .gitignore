@@ -2,16 +2,29 @@
 build/
 
 # TensorRT engines (generated, large)
-engines/*.trt
+engines/
+
+# ONNX models (generated, large)
+onnx/
 
 # Model weights (large, external)
 models/
+
+# Voice presets (generated)
+voices/
 
 # Tokenizer files (downloaded)
 tokenizer/
 
 # Tools (ffmpeg binary)
 tools/ffmpeg.exe
+
+# Claude Code local files
+CLAUDE.local.md
+.claude/
+
+# Windows null device artifact
+nul
 
 # IDE
 .vs/
