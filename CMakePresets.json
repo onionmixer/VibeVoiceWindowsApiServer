@@ -1,0 +1,39 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "release",
+            "displayName": "MSVC Release",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "TENSORRT_ROOT": "$env{TENSORRT_ROOT}",
+                "CUDNN_ROOT": "$env{CUDNN_ROOT}",
+                "CUDAToolkit_ROOT": "$env{CUDA_PATH}"
+            }
+        },
+        {
+            "name": "debug",
+            "displayName": "MSVC Debug",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "TENSORRT_ROOT": "$env{TENSORRT_ROOT}",
+                "CUDNN_ROOT": "$env{CUDNN_ROOT}",
+                "CUDAToolkit_ROOT": "$env{CUDA_PATH}"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "release",
+            "configurePreset": "release"
+        },
+        {
+            "name": "debug",
+            "configurePreset": "debug"
+        }
+    ]
+}

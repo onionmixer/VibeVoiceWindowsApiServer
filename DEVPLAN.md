@@ -447,23 +447,25 @@ install(TARGETS vibevoice_server RUNTIME DESTINATION bin)
         {
             "name": "release",
             "displayName": "MSVC Release",
-            "generator": "Visual Studio 17 2022",
-            "architecture": { "value": "x64" },
+            "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "TENSORRT_ROOT": "$env{TENSORRT_ROOT}"
+                "TENSORRT_ROOT": "$env{TENSORRT_ROOT}",
+                "CUDNN_ROOT": "$env{CUDNN_ROOT}",
+                "CUDAToolkit_ROOT": "$env{CUDA_PATH}"
             }
         },
         {
             "name": "debug",
             "displayName": "MSVC Debug",
-            "generator": "Visual Studio 17 2022",
-            "architecture": { "value": "x64" },
+            "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/debug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "TENSORRT_ROOT": "$env{TENSORRT_ROOT}"
+                "TENSORRT_ROOT": "$env{TENSORRT_ROOT}",
+                "CUDNN_ROOT": "$env{CUDNN_ROOT}",
+                "CUDAToolkit_ROOT": "$env{CUDA_PATH}"
             }
         }
     ],
@@ -511,11 +513,11 @@ build\release\vibevoice_server.exe --config config.json
 ## 7. Development Phases
 
 ### Phase 0: 프로젝트 셋업 (1-2일)
-- [ ] CMakeLists.txt + CMakePresets.json
-- [ ] third_party/ 다운로드 (cpp-httplib, nlohmann/json, dr_libs)
-- [ ] 디렉터리 구조 생성
-- [ ] MSVC + TensorRT + CUDA 링크 확인 (빌드 테스트)
-- [ ] main.cpp 스켈레톤
+- [x] CMakeLists.txt + CMakePresets.json
+- [x] third_party/ 다운로드 (cpp-httplib, nlohmann/json, dr_libs)
+- [x] 디렉터리 구조 생성
+- [x] MSVC + TensorRT + CUDA 링크 확인 (빌드 테스트)
+- [x] main.cpp 스켈레톤
 
 ### Phase 1: Model Conversion Pipeline (3-5일)
 - [ ] `export_onnx.py` — 5개 서브모델 ONNX export
