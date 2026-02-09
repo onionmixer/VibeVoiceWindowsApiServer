@@ -1,7 +1,11 @@
 #include "audio/audio_convert.h"
 
 #include <windows.h>
-#include <cstdio>
+// Windows <windows.h> defines ERROR as a macro, conflicting with LogLevel::ERROR
+#ifdef ERROR
+#undef ERROR
+#endif
+#include "utils/logger.h"
 #include <fstream>
 #include <string>
 
@@ -50,13 +54,13 @@ static bool runFfmpeg(const std::wstring& cmdLine, DWORD timeoutMs = 30000) {
     );
 
     if (!ok) {
-        fprintf(stderr, "Failed to launch ffmpeg (error %lu)\n", GetLastError());
+        LOG_ERROR("CONV", "Failed to launch ffmpeg (error %lu)", GetLastError());
         return false;
     }
 
     DWORD waitResult = WaitForSingleObject(pi.hProcess, timeoutMs);
     if (waitResult == WAIT_TIMEOUT) {
-        fprintf(stderr, "ffmpeg timed out after %lu ms\n", timeoutMs);
+        LOG_WARN("CONV", "ffmpeg timed out after %lu ms", timeoutMs);
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -69,7 +73,7 @@ static bool runFfmpeg(const std::wstring& cmdLine, DWORD timeoutMs = 30000) {
     CloseHandle(pi.hThread);
 
     if (exitCode != 0) {
-        fprintf(stderr, "ffmpeg exited with code %lu\n", exitCode);
+        LOG_ERROR("CONV", "ffmpeg exited with code %lu", exitCode);
         return false;
     }
     return true;
@@ -134,7 +138,7 @@ bool convert(const std::vector<uint8_t>& wavData, OutputFormat format,
     std::wstring tmpOut = getTempFilePath(toWide(formatExtension(format)).c_str());
 
     if (!writeFileBytes(tmpIn, wavData)) {
-        fprintf(stderr, "Failed to write temp WAV file\n");
+        LOG_ERROR("CONV", "Failed to write temp WAV file");
         DeleteFileW(tmpIn.c_str());
         return false;
     }
@@ -149,7 +153,7 @@ bool convert(const std::vector<uint8_t>& wavData, OutputFormat format,
     if (ok) {
         ok = readFileBytes(tmpOut, output);
         if (!ok) {
-            fprintf(stderr, "Failed to read ffmpeg output\n");
+            LOG_ERROR("CONV", "Failed to read ffmpeg output");
         }
     }
 

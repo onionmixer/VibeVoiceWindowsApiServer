@@ -1,11 +1,11 @@
 #include "inference/stt_pipeline.h"
 #include <json.hpp>
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include "utils/logger.h"
 
 using json = nlohmann::json;
 
@@ -34,38 +34,38 @@ bool STTPipeline::load(const Config& cfg) {
 
     // Load metadata
     if (!loadModelMetadata(cfg.metadataPath, meta_)) {
-        fprintf(stderr, "STTPipeline: failed to load metadata from %s\n", cfg.metadataPath.c_str());
+        LOG_ERROR("STT", "failed to load metadata from %s", cfg.metadataPath.c_str());
         return false;
     }
-    fprintf(stderr, "STTPipeline: model_type=%s, hidden=%d, layers=%d, kv_heads=%d\n",
-            meta_.model_type.c_str(), meta_.hidden_size,
-            meta_.num_hidden_layers, meta_.num_key_value_heads);
+    LOG_INFO("STT", "model_type=%s, hidden=%d, layers=%d, kv_heads=%d",
+             meta_.model_type.c_str(), meta_.hidden_size,
+             meta_.num_hidden_layers, meta_.num_key_value_heads);
 
     // Create CUDA stream and cuBLAS handle
     cudaError_t cerr = cudaStreamCreate(&stream_);
     if (cerr != cudaSuccess) {
-        fprintf(stderr, "STTPipeline: failed to create CUDA stream: %s\n", cudaGetErrorString(cerr));
+        LOG_ERROR("STT", "failed to create CUDA stream: %s", cudaGetErrorString(cerr));
         return false;
     }
     cublasStatus_t bstat = cublasCreate(&cublas_);
     if (bstat != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "STTPipeline: failed to create cuBLAS handle\n");
+        LOG_ERROR("STT", "failed to create cuBLAS handle");
         return false;
     }
     cublasSetStream(cublas_, stream_);
 
     // Load tokenizer
     if (!tokenizer_.load(cfg.tokenizerPath)) {
-        fprintf(stderr, "STTPipeline: failed to load tokenizer from %s\n", cfg.tokenizerPath.c_str());
+        LOG_ERROR("STT", "failed to load tokenizer from %s", cfg.tokenizerPath.c_str());
         return false;
     }
     if (!loadASRSpecialTokens(cfg.specialTokensPath, specialTokens_)) {
-        fprintf(stderr, "STTPipeline: failed to load special tokens from %s\n", cfg.specialTokensPath.c_str());
+        LOG_ERROR("STT", "failed to load special tokens from %s", cfg.specialTokensPath.c_str());
         return false;
     }
-    fprintf(stderr, "STTPipeline: tokenizer loaded (vocab=%zu), speech_start=%d, speech_end=%d, speech_pad=%d\n",
-            tokenizer_.vocabSize(), specialTokens_.speech_start,
-            specialTokens_.speech_end, specialTokens_.speech_pad);
+    LOG_INFO("STT", "tokenizer loaded (vocab=%zu), speech_start=%d, speech_end=%d, speech_pad=%d",
+             tokenizer_.vocabSize(), specialTokens_.speech_start,
+             specialTokens_.speech_end, specialTokens_.speech_pad);
 
     // Load TRT engines
     std::string dir = cfg.engineDir + "/";
@@ -73,7 +73,7 @@ bool STTPipeline::load(const Config& cfg) {
     if (!semanticEncoder_.loadFromFile(dir + "semantic_encoder.trt")) return false;
     if (!lmPrefill_.loadFromFile(dir + "language_model_prefill.trt")) return false;
     if (!lmDecode_.loadFromFile(dir + "language_model_decode.trt")) return false;
-    fprintf(stderr, "STTPipeline: loaded 4 TRT engines (ASR)\n");
+    LOG_INFO("STT", "loaded 4 TRT engines (ASR)");
 
     // Load weights
     if (!loadWeights()) return false;
@@ -84,9 +84,10 @@ bool STTPipeline::load(const Config& cfg) {
     connScratchGpu_.resize((size_t)kMaxSeqLen * H * sizeof(uint16_t));
     scratchEmbed_.resize((size_t)H * sizeof(uint16_t));
     logitsGpu_.resize((size_t)kMaxSeqLen * V * sizeof(uint16_t));
+    scratchTokenId_.resize(sizeof(int32_t));
 
     loaded_ = true;
-    fprintf(stderr, "STTPipeline: ready\n");
+    LOG_INFO("STT", "ready");
     return true;
 }
 
@@ -97,7 +98,7 @@ bool STTPipeline::loadWeights() {
     EmbeddingWeights emb;
     if (!loadEmbeddingWeights(dir + "embed_tokens.bin", emb)) return false;
     if (!embedTokensGpu_.upload(emb.data)) return false;
-    fprintf(stderr, "STTPipeline: embed_tokens [%u, %u] uploaded\n", emb.num_embeddings, emb.embedding_dim);
+    LOG_INFO("STT", "embed_tokens [%u, %u] uploaded", emb.num_embeddings, emb.embedding_dim);
 
     // Acoustic connector (64 -> hidden_size)
     ConnectorWeights acConn;
@@ -109,8 +110,8 @@ bool STTPipeline::loadWeights() {
     if (!acConnNormW_.upload(acConn.norm_weight)) return false;
     if (!acConnFc2W_.upload(acConn.fc2_weight)) return false;
     if (!acConnFc2B_.upload(acConn.fc2_bias)) return false;
-    fprintf(stderr, "STTPipeline: acoustic_connector [%u -> %u] uploaded\n",
-            acConn.input_dim, acConn.output_dim);
+    LOG_INFO("STT", "acoustic_connector [%u -> %u] uploaded",
+             acConn.input_dim, acConn.output_dim);
 
     // Semantic connector (128 -> hidden_size)
     ConnectorWeights semConn;
@@ -122,8 +123,8 @@ bool STTPipeline::loadWeights() {
     if (!semConnNormW_.upload(semConn.norm_weight)) return false;
     if (!semConnFc2W_.upload(semConn.fc2_weight)) return false;
     if (!semConnFc2B_.upload(semConn.fc2_bias)) return false;
-    fprintf(stderr, "STTPipeline: semantic_connector [%u -> %u] uploaded\n",
-            semConn.input_dim, semConn.output_dim);
+    LOG_INFO("STT", "semantic_connector [%u -> %u] uploaded",
+             semConn.input_dim, semConn.output_dim);
 
     return true;
 }
@@ -495,12 +496,10 @@ std::vector<int32_t> STTPipeline::runDecode(int prefillLen) {
 
         generatedIds.push_back(nextToken);
 
-        // Embed the token
-        CudaBuffer tokenIdGpu;
-        tokenIdGpu.resize(sizeof(int32_t));
-        tokenIdGpu.copyFromHost(&nextToken, sizeof(int32_t));
+        // Embed the token (reuse member buffer)
+        scratchTokenId_.copyFromHost(&nextToken, sizeof(int32_t));
         GpuOps::embeddingLookup(embedTokensGpu_.as<__half>(),
-                                tokenIdGpu.as<int32_t>(),
+                                scratchTokenId_.as<int32_t>(),
                                 decEmbedGpu.as<__half>(), 1, H, stream_);
 
         // Position

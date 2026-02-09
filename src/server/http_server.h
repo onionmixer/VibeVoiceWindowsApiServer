@@ -4,6 +4,7 @@
 
 #include <httplib.h>
 #include <json.hpp>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -81,5 +82,8 @@ private:
     std::unique_ptr<TTSPipeline> tts15b_;
     std::unique_ptr<STTPipeline> stt_;
 
-    std::mutex gpuMutex_;
+    std::timed_mutex tts05bMutex_;
+    std::timed_mutex tts15bMutex_;
+    std::timed_mutex sttMutex_;
+    std::atomic<bool> shuttingDown_{false};
 };

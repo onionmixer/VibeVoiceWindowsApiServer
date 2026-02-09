@@ -1,7 +1,7 @@
 #include "inference/model_config.h"
+#include "utils/logger.h"
 #include <json.hpp>
 #include <fstream>
-#include <cstdio>
 #include <cstring>
 
 using json = nlohmann::json;
@@ -11,7 +11,7 @@ using json = nlohmann::json;
 static bool readFile(const std::string& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open file: %s\n", path.c_str());
+        LOG_ERROR("CFG", "Cannot open file: %s", path.c_str());
         return false;
     }
     size_t sz = (size_t)f.tellg();
@@ -44,7 +44,7 @@ static bool readVal(const uint8_t*& ptr, const uint8_t* end, T& val) {
 bool loadModelMetadata(const std::string& jsonPath, ModelMetadata& out) {
     std::ifstream f(jsonPath);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open model metadata: %s\n", jsonPath.c_str());
+        LOG_ERROR("CFG", "Cannot open model metadata: %s", jsonPath.c_str());
         return false;
     }
 
@@ -52,7 +52,7 @@ bool loadModelMetadata(const std::string& jsonPath, ModelMetadata& out) {
     try {
         f >> j;
     } catch (const json::parse_error& e) {
-        fprintf(stderr, "JSON parse error in %s: %s\n", jsonPath.c_str(), e.what());
+        LOG_ERROR("CFG", "JSON parse error in %s: %s", jsonPath.c_str(), e.what());
         return false;
     }
 
@@ -164,12 +164,12 @@ bool loadVoicePreset(const std::string& binPath, VoicePreset& out) {
     uint32_t magic = 0, version = 0;
     if (!readVal(ptr, end, magic)) return false;
     if (magic != 0x56425643) { // "VBVC"
-        fprintf(stderr, "Invalid voice preset magic: 0x%08X\n", magic);
+        LOG_ERROR("CFG", "Invalid voice preset magic: 0x%08X", magic);
         return false;
     }
     if (!readVal(ptr, end, version)) return false;
     if (version != 1) {
-        fprintf(stderr, "Unsupported voice preset version: %u\n", version);
+        LOG_ERROR("CFG", "Unsupported voice preset version: %u", version);
         return false;
     }
     if (!readVal(ptr, end, out.num_groups)) return false;
@@ -228,7 +228,7 @@ bool loadScalar(const std::string& binPath, float& out) {
     std::vector<uint8_t> buf;
     if (!readFile(binPath, buf)) return false;
     if (buf.size() < 4) {
-        fprintf(stderr, "Scalar file too small: %s (%zu bytes)\n", binPath.c_str(), buf.size());
+        LOG_ERROR("CFG", "Scalar file too small: %s (%zu bytes)", binPath.c_str(), buf.size());
         return false;
     }
     memcpy(&out, buf.data(), sizeof(float));

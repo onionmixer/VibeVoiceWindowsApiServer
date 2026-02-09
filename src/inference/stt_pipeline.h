@@ -138,4 +138,5 @@ private:
     CudaBuffer positionIdsGpu_;     // [1, S] int64
     CudaBuffer connScratchGpu_;     // scratch for connector
     CudaBuffer scratchEmbed_;       // [1, hidden_size] fp16
+    CudaBuffer scratchTokenId_;     // runDecode: tokenIdGpu [1] int32
 };

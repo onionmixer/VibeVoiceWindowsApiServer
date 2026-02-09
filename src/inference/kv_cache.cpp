@@ -1,6 +1,6 @@
 #include "inference/kv_cache.h"
 #include "utils/cuda_check.h"
-#include <cstdio>
+#include "utils/logger.h"
 #include <cstring>
 
 bool KVCache::init(int numLayers, int numKVHeads, int headDim, int maxSeqLen) {
@@ -19,11 +19,11 @@ bool KVCache::init(int numLayers, int numKVHeads, int headDim, int maxSeqLen) {
 
     for (int i = 0; i < numLayers * 2; ++i) {
         if (!keys_[i].resize(bufSize)) {
-            fprintf(stderr, "KVCache: failed to allocate key buffer %d (%zu bytes)\n", i, bufSize);
+            LOG_ERROR("KV", "failed to allocate key buffer %d (%zu bytes)", i, bufSize);
             return false;
         }
         if (!values_[i].resize(bufSize)) {
-            fprintf(stderr, "KVCache: failed to allocate value buffer %d (%zu bytes)\n", i, bufSize);
+            LOG_ERROR("KV", "failed to allocate value buffer %d (%zu bytes)", i, bufSize);
             return false;
         }
         // Zero-initialize
@@ -31,9 +31,9 @@ bool KVCache::init(int numLayers, int numKVHeads, int headDim, int maxSeqLen) {
         cudaMemset(values_[i].data(), 0, bufSize);
     }
 
-    fprintf(stderr, "KVCache: allocated %d layers, %d kv_heads, head_dim=%d, max_seq=%d (%.1f MB)\n",
-            numLayers, numKVHeads, headDim, maxSeqLen,
-            (float)(numLayers * 2 * 2 * bufSize) / (1024.0f * 1024.0f));
+    LOG_INFO("KV", "allocated %d layers, %d kv_heads, head_dim=%d, max_seq=%d (%.1f MB)",
+             numLayers, numKVHeads, headDim, maxSeqLen,
+             (float)(numLayers * 2 * 2 * bufSize) / (1024.0f * 1024.0f));
     return true;
 }
 
@@ -65,8 +65,8 @@ bool KVCache::loadFromPreset(const VoicePresetGroup& group, int /*hiddenSize*/, 
                                           group.key_cache[layer].data() + h * group.seq_len * headDim,
                                           copyBytes, cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
-                fprintf(stderr, "KVCache: failed to upload key cache layer %d head %d: %s\n",
-                        layer, h, cudaGetErrorString(err));
+                LOG_ERROR("KV", "failed to upload key cache layer %d head %d: %s",
+                         layer, h, cudaGetErrorString(err));
                 return false;
             }
 
@@ -74,8 +74,8 @@ bool KVCache::loadFromPreset(const VoicePresetGroup& group, int /*hiddenSize*/, 
                               group.value_cache[layer].data() + h * group.seq_len * headDim,
                               copyBytes, cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
-                fprintf(stderr, "KVCache: failed to upload value cache layer %d head %d: %s\n",
-                        layer, h, cudaGetErrorString(err));
+                LOG_ERROR("KV", "failed to upload value cache layer %d head %d: %s",
+                         layer, h, cudaGetErrorString(err));
                 return false;
             }
         }

@@ -1,9 +1,9 @@
 #include "tokenizer/bpe_tokenizer.h"
 #include "tokenizer/special_tokens.h"
 #include "tokenizer/unicode_utils.h"
+#include "utils/logger.h"
 #include <json.hpp>
 #include <algorithm>
-#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -54,7 +54,7 @@ BPETokenizer::~BPETokenizer() = default;
 bool BPETokenizer::load(const std::string& tokenizerJsonPath) {
     std::ifstream f(tokenizerJsonPath);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open tokenizer: %s\n", tokenizerJsonPath.c_str());
+        LOG_ERROR("TOK", "Cannot open tokenizer: %s", tokenizerJsonPath.c_str());
         return false;
     }
 
@@ -62,7 +62,7 @@ bool BPETokenizer::load(const std::string& tokenizerJsonPath) {
     try {
         f >> j;
     } catch (const json::parse_error& e) {
-        fprintf(stderr, "JSON parse error in tokenizer: %s\n", e.what());
+        LOG_ERROR("TOK", "JSON parse error in tokenizer: %s", e.what());
         return false;
     }
 
@@ -79,7 +79,7 @@ bool BPETokenizer::load(const std::string& tokenizerJsonPath) {
 
     // Parse vocab
     if (!j.contains("model") || !j["model"].contains("vocab")) {
-        fprintf(stderr, "No model.vocab in tokenizer.json\n");
+        LOG_ERROR("TOK", "No model.vocab in tokenizer.json");
         return false;
     }
 
@@ -131,8 +131,8 @@ bool BPETokenizer::load(const std::string& tokenizerJsonPath) {
     }
 
     loaded_ = true;
-    fprintf(stderr, "Tokenizer loaded: vocab=%zu, merges=%zu, added_tokens=%zu\n",
-            tokenToId_.size(), mergeRanks_.size(), addedTokens_.size());
+    LOG_INFO("TOK", "Tokenizer loaded: vocab=%zu, merges=%zu, added_tokens=%zu",
+             tokenToId_.size(), mergeRanks_.size(), addedTokens_.size());
     return true;
 }
 
@@ -495,7 +495,7 @@ const std::string& BPETokenizer::idToToken(int32_t id) const {
 bool loadTTSSpecialTokens(const std::string& jsonPath, TTSSpecialTokens& out) {
     std::ifstream f(jsonPath);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open special tokens: %s\n", jsonPath.c_str());
+        LOG_ERROR("TOK", "Cannot open special tokens: %s", jsonPath.c_str());
         return false;
     }
 
@@ -503,7 +503,7 @@ bool loadTTSSpecialTokens(const std::string& jsonPath, TTSSpecialTokens& out) {
     try {
         f >> j;
     } catch (const json::parse_error& e) {
-        fprintf(stderr, "JSON parse error: %s\n", e.what());
+        LOG_ERROR("TOK", "JSON parse error: %s", e.what());
         return false;
     }
 
@@ -519,7 +519,7 @@ bool loadTTSSpecialTokens(const std::string& jsonPath, TTSSpecialTokens& out) {
 bool loadASRSpecialTokens(const std::string& jsonPath, ASRSpecialTokens& out) {
     std::ifstream f(jsonPath);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open special tokens: %s\n", jsonPath.c_str());
+        LOG_ERROR("TOK", "Cannot open special tokens: %s", jsonPath.c_str());
         return false;
     }
 
@@ -527,7 +527,7 @@ bool loadASRSpecialTokens(const std::string& jsonPath, ASRSpecialTokens& out) {
     try {
         f >> j;
     } catch (const json::parse_error& e) {
-        fprintf(stderr, "JSON parse error: %s\n", e.what());
+        LOG_ERROR("TOK", "JSON parse error: %s", e.what());
         return false;
     }
 

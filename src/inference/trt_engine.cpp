@@ -1,5 +1,5 @@
 #include "inference/trt_engine.h"
-#include <cstdio>
+#include "utils/logger.h"
 #include <fstream>
 #include <vector>
 
@@ -11,18 +11,20 @@ TRTLogger& TRTLogger::instance() {
 }
 
 void TRTLogger::log(Severity severity, const char* msg) noexcept {
-    // Always log errors/warnings; info/verbose only if verbose mode
     if (severity <= Severity::kWARNING) {
-        const char* level = "???";
         switch (severity) {
-            case Severity::kINTERNAL_ERROR: level = "INTERNAL_ERROR"; break;
-            case Severity::kERROR:          level = "ERROR"; break;
-            case Severity::kWARNING:        level = "WARNING"; break;
-            default: break;
+            case Severity::kINTERNAL_ERROR:
+            case Severity::kERROR:
+                LOG_ERROR("TRT", "%s", msg);
+                break;
+            case Severity::kWARNING:
+                LOG_WARN("TRT", "%s", msg);
+                break;
+            default:
+                break;
         }
-        fprintf(stderr, "[TensorRT %s] %s\n", level, msg);
     } else if (verbose_) {
-        fprintf(stderr, "[TensorRT] %s\n", msg);
+        LOG_DEBUG("TRT", "%s", msg);
     }
 }
 
@@ -101,7 +103,7 @@ bool TRTEngine::loadFromFile(const std::string& path) {
     // Read serialized engine
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open TRT engine: %s\n", path.c_str());
+        LOG_ERROR("TRT", "Cannot open TRT engine: %s", path.c_str());
         return false;
     }
     size_t fileSize = (size_t)f.tellg();
@@ -109,34 +111,34 @@ bool TRTEngine::loadFromFile(const std::string& path) {
     std::vector<char> engineData(fileSize);
     f.read(engineData.data(), fileSize);
     if (!f.good()) {
-        fprintf(stderr, "Failed to read TRT engine file: %s\n", path.c_str());
+        LOG_ERROR("TRT", "Failed to read TRT engine file: %s", path.c_str());
         return false;
     }
 
     // Create runtime
     runtime_ = nvinfer1::createInferRuntime(TRTLogger::instance());
     if (!runtime_) {
-        fprintf(stderr, "Failed to create TensorRT runtime\n");
+        LOG_ERROR("TRT", "Failed to create TensorRT runtime");
         return false;
     }
 
     // Deserialize engine
     engine_ = runtime_->deserializeCudaEngine(engineData.data(), fileSize);
     if (!engine_) {
-        fprintf(stderr, "Failed to deserialize TRT engine: %s\n", path.c_str());
+        LOG_ERROR("TRT", "Failed to deserialize TRT engine: %s", path.c_str());
         return false;
     }
 
     // Create execution context
     context_ = engine_->createExecutionContext();
     if (!context_) {
-        fprintf(stderr, "Failed to create TRT execution context\n");
+        LOG_ERROR("TRT", "Failed to create TRT execution context");
         return false;
     }
 
     // Enumerate I/O tensors
     if (!enumerateTensors()) {
-        fprintf(stderr, "Failed to enumerate tensors\n");
+        LOG_ERROR("TRT", "Failed to enumerate tensors");
         return false;
     }
 

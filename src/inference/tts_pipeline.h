@@ -149,4 +149,15 @@ private:
     CudaBuffer positionIdsBuf_;    // [1, 1] int64
     CudaBuffer inputIdBuf_;        // [1] int32
     CudaBuffer connScratch_;       // [1, outputDim] fp16 (connector intermediate)
+
+    // Per-request scratch buffers (promoted from local to avoid cudaMalloc/Free per request)
+    CudaBuffer scratchDenormLatent_;    // synth05B: denormLatent [64] fp16
+    CudaBuffer scratchDecoderInput_;    // synth05B: decoderInput [64] fp16
+    CudaBuffer scratchAudioChunk_;      // synth05B: audioChunkGpu [maxHop] fp16
+    CudaBuffer scratchAudioF32_;        // synth05B: audioF32Gpu [maxHop] fp32
+    CudaBuffer scratchSampleF32_;       // sampleSpeechTokens: sampleF32Gpu [2*128] fp32
+    CudaBuffer scratchVpredF32_;        // sampleSpeechTokens: vpredF32Gpu [2*128] fp32
+    CudaBuffer scratchEosHidden_;       // runEosClassifier: fc1Out [hidden] fp16
+    CudaBuffer scratchEosOut_;          // runEosClassifier: fc2Out [1] fp16
+    CudaBuffer scratchEosSigmoid_;      // runEosClassifier: sigmoidOut [1] fp32
 };

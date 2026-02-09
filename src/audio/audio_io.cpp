@@ -9,8 +9,8 @@ extern "C" {
 #include "stb_vorbis.c"
 }
 
+#include "utils/logger.h"
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <algorithm>
 
@@ -54,7 +54,7 @@ static bool loadWav(const std::string& path, std::vector<float>& samples,
                     uint32_t& sampleRate, uint32_t& channels) {
     drwav wav;
     if (!drwav_init_file(&wav, path.c_str(), nullptr)) {
-        fprintf(stderr, "Failed to open WAV: %s\n", path.c_str());
+        LOG_ERROR("AIO", "Failed to open WAV: %s", path.c_str());
         return false;
     }
     uint64_t totalFrames = wav.totalPCMFrameCount;
@@ -70,7 +70,7 @@ static bool loadMp3(const std::string& path, std::vector<float>& samples,
                     uint32_t& sampleRate, uint32_t& channels) {
     drmp3 mp3;
     if (!drmp3_init_file(&mp3, path.c_str(), nullptr)) {
-        fprintf(stderr, "Failed to open MP3: %s\n", path.c_str());
+        LOG_ERROR("AIO", "Failed to open MP3: %s", path.c_str());
         return false;
     }
     uint64_t totalFrames = drmp3_get_pcm_frame_count(&mp3);
@@ -86,7 +86,7 @@ static bool loadFlac(const std::string& path, std::vector<float>& samples,
                      uint32_t& sampleRate, uint32_t& channels) {
     drflac* flac = drflac_open_file(path.c_str(), nullptr);
     if (!flac) {
-        fprintf(stderr, "Failed to open FLAC: %s\n", path.c_str());
+        LOG_ERROR("AIO", "Failed to open FLAC: %s", path.c_str());
         return false;
     }
     uint64_t totalFrames = flac->totalPCMFrameCount;
@@ -104,7 +104,7 @@ static bool loadOgg(const std::string& path, std::vector<float>& samples,
     short* decoded = nullptr;
     int numSamples = stb_vorbis_decode_filename(path.c_str(), &ch, &sr, &decoded);
     if (numSamples <= 0 || !decoded) {
-        fprintf(stderr, "Failed to open OGG: %s\n", path.c_str());
+        LOG_ERROR("AIO", "Failed to open OGG: %s", path.c_str());
         return false;
     }
     channels = (uint32_t)ch;
@@ -188,7 +188,7 @@ bool load(const std::string& path, std::vector<float>& samples,
         case AudioFormat::FLAC: return loadFlac(path, samples, sampleRate, channels);
         case AudioFormat::OGG:  return loadOgg(path, samples, sampleRate, channels);
         default:
-            fprintf(stderr, "Unknown audio format: %s\n", path.c_str());
+            LOG_ERROR("AIO", "Unknown audio format: %s", path.c_str());
             return false;
     }
 }
@@ -205,7 +205,7 @@ bool loadFromMemory(const uint8_t* data, size_t size, AudioFormat fmt,
         case AudioFormat::FLAC: return loadFlacMem(data, size, samples, sampleRate, channels);
         case AudioFormat::OGG:  return loadOggMem(data, size, samples, sampleRate, channels);
         default:
-            fprintf(stderr, "Unknown audio format from memory\n");
+            LOG_ERROR("AIO", "Unknown audio format from memory");
             return false;
     }
 }
@@ -221,7 +221,7 @@ bool writeWav(const std::string& path, const std::vector<float>& samples,
     format.bitsPerSample = 16;
 
     if (!drwav_init_file_write(&wav, path.c_str(), &format, nullptr)) {
-        fprintf(stderr, "Failed to create WAV: %s\n", path.c_str());
+        LOG_ERROR("AIO", "Failed to create WAV: %s", path.c_str());
         return false;
     }
 

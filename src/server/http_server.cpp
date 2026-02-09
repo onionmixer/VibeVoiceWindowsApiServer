@@ -2,8 +2,8 @@
 #include "audio/audio_io.h"
 #include "audio/audio_convert.h"
 
+#include "utils/logger.h"
 #include <json.hpp>
-#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <ctime>
@@ -15,7 +15,7 @@ using json = nlohmann::json;
 bool loadServerConfig(const std::string& jsonPath, ServerConfig& out) {
     std::ifstream f(jsonPath);
     if (!f.is_open()) {
-        fprintf(stderr, "Cannot open config: %s\n", jsonPath.c_str());
+        LOG_ERROR("HTTP", "Cannot open config: %s", jsonPath.c_str());
         return false;
     }
 
@@ -23,7 +23,7 @@ bool loadServerConfig(const std::string& jsonPath, ServerConfig& out) {
     try {
         f >> j;
     } catch (const json::parse_error& e) {
-        fprintf(stderr, "Config JSON parse error: %s\n", e.what());
+        LOG_ERROR("HTTP", "Config JSON parse error: %s", e.what());
         return false;
     }
 
@@ -107,7 +107,7 @@ bool HttpServer::init(const ServerConfig& cfg) {
         tcfg.cfgScale = cfg_.tts05b.cfgScale;
         tcfg.inferenceSteps = cfg_.tts05b.inferenceSteps;
         if (!tts05b_->load(tcfg)) {
-            fprintf(stderr, "HttpServer: failed to load TTS 0.5B\n");
+            LOG_ERROR("HTTP", "failed to load TTS 0.5B");
             tts05b_.reset();
         }
     }
@@ -126,7 +126,7 @@ bool HttpServer::init(const ServerConfig& cfg) {
         tcfg.cfgScale = cfg_.tts15b.cfgScale;
         tcfg.inferenceSteps = cfg_.tts15b.inferenceSteps;
         if (!tts15b_->load(tcfg)) {
-            fprintf(stderr, "HttpServer: failed to load TTS 1.5B\n");
+            LOG_ERROR("HTTP", "failed to load TTS 1.5B");
             tts15b_.reset();
         }
     }
@@ -143,7 +143,7 @@ bool HttpServer::init(const ServerConfig& cfg) {
         scfg.maxNewTokens = cfg_.asr.maxNewTokens;
         scfg.temperature = cfg_.asr.temperature;
         if (!stt_->load(scfg)) {
-            fprintf(stderr, "HttpServer: failed to load STT\n");
+            LOG_ERROR("HTTP", "failed to load STT");
             stt_.reset();
         }
     }
@@ -178,19 +178,20 @@ bool HttpServer::init(const ServerConfig& cfg) {
         handleTranslations(req, res);
     });
 
-    fprintf(stderr, "HttpServer: initialized (TTS_0.5B=%s, TTS_1.5B=%s, STT=%s)\n",
-            tts05b_ ? "loaded" : "off",
-            tts15b_ ? "loaded" : "off",
-            stt_ ? "loaded" : "off");
+    LOG_INFO("HTTP", "initialized (TTS_0.5B=%s, TTS_1.5B=%s, STT=%s)",
+             tts05b_ ? "loaded" : "off",
+             tts15b_ ? "loaded" : "off",
+             stt_ ? "loaded" : "off");
     return true;
 }
 
 void HttpServer::run() {
-    fprintf(stderr, "HttpServer: listening on %s:%d\n", cfg_.host.c_str(), cfg_.port);
+    LOG_INFO("HTTP", "listening on %s:%d", cfg_.host.c_str(), cfg_.port);
     svr_.listen(cfg_.host, cfg_.port);
 }
 
 void HttpServer::stop() {
+    shuttingDown_ = true;
     svr_.stop();
 }
 
@@ -301,12 +302,16 @@ void HttpServer::handleVoices(const httplib::Request&, httplib::Response& res) {
 // ── POST /v1/audio/speech ──
 
 void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& res) {
+    static std::atomic<uint64_t> counter{0};
+    Logger::setRequestId("tts-" + std::to_string(counter.fetch_add(1)));
+
     // Parse JSON body
     json body;
     try {
         body = json::parse(req.body);
     } catch (const json::parse_error&) {
         sendError(res, 400, "Invalid JSON body");
+        Logger::clearRequestId();
         return;
     }
 
@@ -318,8 +323,12 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
 
     if (input.empty()) {
         sendError(res, 400, "Missing 'input' field");
+        Logger::clearRequestId();
         return;
     }
+
+    LOG_INFO("HTTP", "POST /v1/audio/speech model=%s voice=%s format=%s",
+             modelName.c_str(), voice.c_str(), responseFormat.c_str());
 
     // Map names
     std::string mapped = mapModelName(modelName);
@@ -327,30 +336,43 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
 
     // Select pipeline
     TTSPipeline* pipeline = nullptr;
+    bool use05b = false;
     if (mapped == "tts_0.5b" && tts05b_ && tts05b_->isLoaded()) {
         pipeline = tts05b_.get();
+        use05b = true;
     } else if (mapped == "tts_1.5b" && tts15b_ && tts15b_->isLoaded()) {
         pipeline = tts15b_.get();
     } else if (tts05b_ && tts05b_->isLoaded()) {
         pipeline = tts05b_.get();
+        use05b = true;
     } else if (tts15b_ && tts15b_->isLoaded()) {
         pipeline = tts15b_.get();
     }
 
     if (!pipeline) {
         sendError(res, 503, "No TTS model available", "server_error");
+        Logger::clearRequestId();
         return;
     }
 
-    // Synthesize (GPU-serialized)
+    // Synthesize with per-pipeline mutex + timeout
+    auto& mtx = use05b ? tts05bMutex_ : tts15bMutex_;
+    std::unique_lock<std::timed_mutex> lock(mtx, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::seconds(30))) {
+        sendError(res, 503, "Model busy, try again later", "server_error");
+        Logger::clearRequestId();
+        return;
+    }
+
     TTSPipeline::Result result;
     {
-        std::lock_guard<std::mutex> lock(gpuMutex_);
+        LOG_TIMER("HTTP", "speech synthesis");
         result = pipeline->synthesize({input, voiceMapped, speed});
     }
 
     if (!result.ok) {
         sendError(res, 500, result.error, "server_error");
+        Logger::clearRequestId();
         return;
     }
 
@@ -413,6 +435,7 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
         std::string tmpWav = "temp_tts_" + std::to_string(std::time(nullptr)) + ".wav";
         if (!AudioIO::writeWav(tmpWav, result.audio, (uint32_t)result.sampleRate)) {
             sendError(res, 500, "Failed to create temp WAV", "server_error");
+            Logger::clearRequestId();
             return;
         }
 
@@ -433,6 +456,7 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
         } else {
             remove(tmpWav.c_str());
             sendError(res, 400, "Unsupported response_format: " + responseFormat);
+            Logger::clearRequestId();
             return;
         }
 
@@ -442,6 +466,7 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
 
         if (!convOk) {
             sendError(res, 500, "Audio format conversion failed (ffmpeg required)", "server_error");
+            Logger::clearRequestId();
             return;
         }
 
@@ -450,6 +475,7 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
         if (!outFile.is_open()) {
             remove(tmpOut.c_str());
             sendError(res, 500, "Failed to read converted audio", "server_error");
+            Logger::clearRequestId();
             return;
         }
         size_t outSize = (size_t)outFile.tellg();
@@ -461,24 +487,31 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
 
         res.set_content(outData, contentType);
     }
+    Logger::clearRequestId();
 }
 
 // ── POST /v1/audio/transcriptions ──
 
 void HttpServer::handleTranscriptions(const httplib::Request& req, httplib::Response& res) {
+    static std::atomic<uint64_t> counter{0};
+    Logger::setRequestId("stt-" + std::to_string(counter.fetch_add(1)));
+
     if (!stt_ || !stt_->isLoaded()) {
         sendError(res, 503, "STT model not available", "server_error");
+        Logger::clearRequestId();
         return;
     }
 
     if (!req.is_multipart_form_data()) {
         sendError(res, 400, "Expected multipart/form-data");
+        Logger::clearRequestId();
         return;
     }
 
     // Get file
     if (!req.form.has_file("file")) {
         sendError(res, 400, "Missing 'file' field");
+        Logger::clearRequestId();
         return;
     }
     auto file = req.form.get_file("file");
@@ -496,19 +529,30 @@ void HttpServer::handleTranscriptions(const httplib::Request& req, httplib::Resp
     std::string tempStr = req.form.get_field("temperature");
     if (!tempStr.empty()) temperature = std::stof(tempStr);
 
+    LOG_INFO("HTTP", "POST /v1/audio/transcriptions format=%s lang=%s",
+             responseFormat.c_str(), language.c_str());
+
     // Decode audio from memory
     std::vector<float> audio;
     if (!AudioIO::loadAndPrepareFromMemory(
             reinterpret_cast<const uint8_t*>(file.content.data()),
             file.content.size(), audio, 24000, -25.0f)) {
         sendError(res, 400, "Failed to decode audio file");
+        Logger::clearRequestId();
         return;
     }
 
-    // Transcribe (GPU-serialized)
+    // Transcribe with per-pipeline mutex + timeout
+    std::unique_lock<std::timed_mutex> lock(sttMutex_, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::seconds(60))) {
+        sendError(res, 503, "STT model busy, try again later", "server_error");
+        Logger::clearRequestId();
+        return;
+    }
+
     STTPipeline::Result result;
     {
-        std::lock_guard<std::mutex> lock(gpuMutex_);
+        LOG_TIMER("HTTP", "transcription");
         STTPipeline::Request sreq;
         sreq.audio = std::move(audio);
         sreq.sampleRate = 24000;
@@ -521,6 +565,7 @@ void HttpServer::handleTranscriptions(const httplib::Request& req, httplib::Resp
 
     if (!result.ok) {
         sendError(res, 500, result.error, "server_error");
+        Logger::clearRequestId();
         return;
     }
 
@@ -559,23 +604,30 @@ void HttpServer::handleTranscriptions(const httplib::Request& req, httplib::Resp
         j["text"] = result.text;
         res.set_content(j.dump(), "application/json");
     }
+    Logger::clearRequestId();
 }
 
 // ── POST /v1/audio/translations ──
 
 void HttpServer::handleTranslations(const httplib::Request& req, httplib::Response& res) {
+    static std::atomic<uint64_t> counter{0};
+    Logger::setRequestId("translate-" + std::to_string(counter.fetch_add(1)));
+
     if (!stt_ || !stt_->isLoaded()) {
         sendError(res, 503, "STT model not available", "server_error");
+        Logger::clearRequestId();
         return;
     }
 
     if (!req.is_multipart_form_data()) {
         sendError(res, 400, "Expected multipart/form-data");
+        Logger::clearRequestId();
         return;
     }
 
     if (!req.form.has_file("file")) {
         sendError(res, 400, "Missing 'file' field");
+        Logger::clearRequestId();
         return;
     }
     auto file = req.form.get_file("file");
@@ -590,17 +642,29 @@ void HttpServer::handleTranslations(const httplib::Request& req, httplib::Respon
     std::string tempStr = req.form.get_field("temperature");
     if (!tempStr.empty()) temperature = std::stof(tempStr);
 
+    LOG_INFO("HTTP", "POST /v1/audio/translations format=%s",
+             responseFormat.c_str());
+
     std::vector<float> audio;
     if (!AudioIO::loadAndPrepareFromMemory(
             reinterpret_cast<const uint8_t*>(file.content.data()),
             file.content.size(), audio, 24000, -25.0f)) {
         sendError(res, 400, "Failed to decode audio file");
+        Logger::clearRequestId();
+        return;
+    }
+
+    // Translate with per-pipeline mutex + timeout
+    std::unique_lock<std::timed_mutex> lock(sttMutex_, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::seconds(60))) {
+        sendError(res, 503, "STT model busy, try again later", "server_error");
+        Logger::clearRequestId();
         return;
     }
 
     STTPipeline::Result result;
     {
-        std::lock_guard<std::mutex> lock(gpuMutex_);
+        LOG_TIMER("HTTP", "translation");
         STTPipeline::Request sreq;
         sreq.audio = std::move(audio);
         sreq.sampleRate = 24000;
@@ -613,6 +677,7 @@ void HttpServer::handleTranslations(const httplib::Request& req, httplib::Respon
 
     if (!result.ok) {
         sendError(res, 500, result.error, "server_error");
+        Logger::clearRequestId();
         return;
     }
 
@@ -646,4 +711,5 @@ void HttpServer::handleTranslations(const httplib::Request& req, httplib::Respon
         j["text"] = result.text;
         res.set_content(j.dump(), "application/json");
     }
+    Logger::clearRequestId();
 }

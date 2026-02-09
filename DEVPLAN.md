@@ -552,28 +552,29 @@ build\release\vibevoice_server.exe --config config.json
   - [x] LM → Diffusion(10 steps) → Acoustic decode → WAV
 
 ### Phase 4: STT Pipeline (4-5일)
-- [ ] Audio 전처리 (resample, normalize, mono)
-- [ ] Acoustic/Semantic encoding
-- [ ] Prompt token 구성
-- [ ] LM autoregressive text generation
-- [ ] Text decode + segment/timestamp/speaker 파싱
-- [ ] SRT/VTT output
+- [x] Audio 전처리 (resample, normalize, mono)
+- [x] Acoustic/Semantic encoding
+- [x] Prompt token 구성
+- [x] LM autoregressive text generation
+- [x] Text decode + segment/timestamp/speaker 파싱
+- [x] SRT/VTT output
 
 ### Phase 5: HTTP API (2-3일)
-- [ ] POST /v1/audio/speech
-- [ ] POST /v1/audio/transcriptions
-- [ ] POST /v1/audio/translations
-- [ ] GET /health, /v1/models, /v1/audio/voices
-- [ ] Multipart form-data 파싱
-- [ ] Audio format conversion
-- [ ] CORS + error handling
+- [x] POST /v1/audio/speech
+- [x] POST /v1/audio/transcriptions
+- [x] POST /v1/audio/translations
+- [x] GET /health, /v1/models, /v1/audio/voices
+- [x] Multipart form-data 파싱
+- [x] Audio format conversion
+- [x] CORS + error handling
 
 ### Phase 6: Integration & Optimization (3-4일)
-- [ ] E2E test (Python 서버 output과 비교)
-- [ ] CUDA stream 비동기
-- [ ] GPU 메모리 풀링
-- [ ] Thread safety
-- [ ] Logging
+- [x] Logger 시스템 (타임스탬프, 로그 레벨, 모듈 태그, 요청 ID, RAII 타이머)
+- [x] fprintf → Logger 일괄 교체 (11개 소스 파일)
+- [x] GPU 메모리 최적화 (per-request 임시 버퍼 → 멤버 scratch 버퍼 승격)
+- [x] Thread safety (per-pipeline timed_mutex, graceful shutdown)
+- [x] 테스트 리팩터링 (main.cpp 931줄 → 85줄, tests/ 분리)
+- [x] E2E 테스트 (HTTP 엔드포인트 + 조건부 TRT 추론)
 
 ### Phase 7: 패키징 (1-2일)
 - [ ] Release 빌드 (/O2, LTCG)

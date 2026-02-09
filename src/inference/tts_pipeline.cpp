@@ -1,6 +1,6 @@
 #include "inference/tts_pipeline.h"
 #include <algorithm>
-#include <cstdio>
+#include "utils/logger.h"
 #include <cstring>
 #include <cmath>
 #include <random>
@@ -31,36 +31,36 @@ bool TTSPipeline::load(const Config& cfg) {
 
     // Load metadata
     if (!loadModelMetadata(cfg.metadataPath, meta_)) {
-        fprintf(stderr, "TTSPipeline: failed to load metadata from %s\n", cfg.metadataPath.c_str());
+        LOG_ERROR("TTS", "failed to load metadata from %s", cfg.metadataPath.c_str());
         return false;
     }
-    fprintf(stderr, "TTSPipeline: model_type=%s, hidden=%d, diffusion=%s\n",
-            meta_.model_type.c_str(), meta_.hidden_size,
-            meta_.has_diffusion ? "yes" : "no");
+    LOG_INFO("TTS", "model_type=%s, hidden=%d, diffusion=%s",
+             meta_.model_type.c_str(), meta_.hidden_size,
+             meta_.has_diffusion ? "yes" : "no");
 
     // Create CUDA stream and cuBLAS handle
     cudaError_t cerr = cudaStreamCreate(&stream_);
     if (cerr != cudaSuccess) {
-        fprintf(stderr, "TTSPipeline: failed to create CUDA stream: %s\n", cudaGetErrorString(cerr));
+        LOG_ERROR("TTS", "failed to create CUDA stream: %s", cudaGetErrorString(cerr));
         return false;
     }
     cublasStatus_t bstat = cublasCreate(&cublas_);
     if (bstat != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "TTSPipeline: failed to create cuBLAS handle\n");
+        LOG_ERROR("TTS", "failed to create cuBLAS handle");
         return false;
     }
     cublasSetStream(cublas_, stream_);
 
     // Load tokenizer
     if (!tokenizer_.load(cfg.tokenizerPath)) {
-        fprintf(stderr, "TTSPipeline: failed to load tokenizer from %s\n", cfg.tokenizerPath.c_str());
+        LOG_ERROR("TTS", "failed to load tokenizer from %s", cfg.tokenizerPath.c_str());
         return false;
     }
     if (!loadTTSSpecialTokens(cfg.specialTokensPath, specialTokens_)) {
-        fprintf(stderr, "TTSPipeline: failed to load special tokens from %s\n", cfg.specialTokensPath.c_str());
+        LOG_ERROR("TTS", "failed to load special tokens from %s", cfg.specialTokensPath.c_str());
         return false;
     }
-    fprintf(stderr, "TTSPipeline: tokenizer loaded (vocab=%zu)\n", tokenizer_.vocabSize());
+    LOG_INFO("TTS", "tokenizer loaded (vocab=%zu)", tokenizer_.vocabSize());
 
     // Load TRT engines
     if (type_ == ModelType::STREAMING_0_5B) {
@@ -71,7 +71,7 @@ bool TTSPipeline::load(const Config& cfg) {
         if (!ttsLmDecode_.loadFromFile(dir + "tts_lm_decode.trt")) return false;
         if (!diffusionHead_.loadFromFile(dir + "diffusion_head.trt")) return false;
         if (!acousticDecoder_.loadFromFile(dir + "acoustic_decoder.trt")) return false;
-        fprintf(stderr, "TTSPipeline: loaded 6 TRT engines (0.5B)\n");
+        LOG_INFO("TTS", "loaded 6 TRT engines (0.5B)");
     } else {
         std::string dir = cfg.engineDir + "/";
         if (!lmPrefill_.loadFromFile(dir + "language_model_prefill.trt")) return false;
@@ -79,7 +79,7 @@ bool TTSPipeline::load(const Config& cfg) {
         if (!acousticEncoder_.loadFromFile(dir + "acoustic_encoder.trt")) return false;
         if (!diffusionHead_.loadFromFile(dir + "diffusion_head.trt")) return false;
         if (!acousticDecoder_.loadFromFile(dir + "acoustic_decoder.trt")) return false;
-        fprintf(stderr, "TTSPipeline: loaded 5 TRT engines (1.5B)\n");
+        LOG_INFO("TTS", "loaded 5 TRT engines (1.5B)");
     }
 
     // Load weights
@@ -115,8 +115,22 @@ bool TTSPipeline::load(const Config& cfg) {
     inputIdBuf_.resize(sizeof(int32_t));
     connScratch_.resize(H * sizeof(uint16_t));
 
+    // Per-request scratch buffers (pre-allocate to avoid cudaMalloc per request)
+    int hopLen = meta_.hop_length > 0 ? meta_.hop_length : 3200;
+    scratchDenormLatent_.resize(latentDim * sizeof(uint16_t));
+    scratchDecoderInput_.resize(64 * sizeof(uint16_t));
+    scratchAudioChunk_.resize(hopLen * sizeof(uint16_t));
+    scratchAudioF32_.resize(hopLen * sizeof(float));
+    scratchSampleF32_.resize(2 * latentDim * sizeof(float));
+    scratchVpredF32_.resize(2 * latentDim * sizeof(float));
+    if (eosHiddenSize_ > 0) {
+        scratchEosHidden_.resize(eosHiddenSize_ * sizeof(uint16_t));
+        scratchEosOut_.resize(1 * sizeof(uint16_t));
+        scratchEosSigmoid_.resize(sizeof(float));
+    }
+
     loaded_ = true;
-    fprintf(stderr, "TTSPipeline: ready (%zu voices available)\n", availableVoices().size());
+    LOG_INFO("TTS", "ready (%zu voices available)", availableVoices().size());
     return true;
 }
 
@@ -127,7 +141,7 @@ bool TTSPipeline::loadWeights() {
     EmbeddingWeights emb;
     if (!loadEmbeddingWeights(dir + "embed_tokens.bin", emb)) return false;
     if (!embedTokensGpu_.upload(emb.data)) return false;
-    fprintf(stderr, "TTSPipeline: embed_tokens [%u, %u] uploaded\n", emb.num_embeddings, emb.embedding_dim);
+    LOG_INFO("TTS", "embed_tokens [%u, %u] uploaded", emb.num_embeddings, emb.embedding_dim);
 
     // Acoustic connector
     ConnectorWeights conn;
@@ -139,19 +153,19 @@ bool TTSPipeline::loadWeights() {
     if (!connNormW_.upload(conn.norm_weight)) return false;
     if (!connFc2W_.upload(conn.fc2_weight)) return false;
     if (!connFc2B_.upload(conn.fc2_bias)) return false;
-    fprintf(stderr, "TTSPipeline: acoustic_connector [%u -> %u] uploaded\n", conn.input_dim, conn.output_dim);
+    LOG_INFO("TTS", "acoustic_connector [%u -> %u] uploaded", conn.input_dim, conn.output_dim);
 
     // Scaling factors
     if (!loadScalar(dir + "speech_scaling_factor.bin", speechScalingFactor_)) return false;
     if (!loadScalar(dir + "speech_bias_factor.bin", speechBiasFactor_)) return false;
-    fprintf(stderr, "TTSPipeline: scaling=%.4f, bias=%.4f\n", speechScalingFactor_, speechBiasFactor_);
+    LOG_INFO("TTS", "scaling=%.4f, bias=%.4f", speechScalingFactor_, speechBiasFactor_);
 
     if (type_ == ModelType::STREAMING_0_5B) {
         // TTS input types
         TTSInputTypesWeights ttsTypes;
         if (!loadTTSInputTypesWeights(dir + "tts_input_types.bin", ttsTypes)) return false;
         if (!ttsInputTypesGpu_.upload(ttsTypes.data)) return false;
-        fprintf(stderr, "TTSPipeline: tts_input_types [%u, %u] uploaded\n", ttsTypes.num_types, ttsTypes.embedding_dim);
+        LOG_INFO("TTS", "tts_input_types [%u, %u] uploaded", ttsTypes.num_types, ttsTypes.embedding_dim);
 
         // EOS classifier
         BinaryClassifierWeights eos;
@@ -161,7 +175,7 @@ bool TTSPipeline::loadWeights() {
         if (!eosFc1B_.upload(eos.fc1_bias)) return false;
         if (!eosFc2W_.upload(eos.fc2_weight)) return false;
         if (!eosFc2B_.upload(eos.fc2_bias)) return false;
-        fprintf(stderr, "TTSPipeline: tts_eos_classifier [%u] uploaded\n", eos.hidden_size);
+        LOG_INFO("TTS", "tts_eos_classifier [%u] uploaded", eos.hidden_size);
     }
 
     if (type_ == ModelType::FULL_1_5B) {
@@ -173,8 +187,8 @@ bool TTSPipeline::loadWeights() {
         if (!semanticConnNormW_.upload(semConn.norm_weight)) return false;
         if (!semanticConnFc2W_.upload(semConn.fc2_weight)) return false;
         if (!semanticConnFc2B_.upload(semConn.fc2_bias)) return false;
-        fprintf(stderr, "TTSPipeline: semantic_connector [%u -> %u] uploaded\n",
-                semConn.input_dim, semConn.output_dim);
+        LOG_INFO("TTS", "semantic_connector [%u -> %u] uploaded",
+                 semConn.input_dim, semConn.output_dim);
     }
 
     return true;
@@ -184,7 +198,7 @@ bool TTSPipeline::loadVoicePresets() {
     if (type_ == ModelType::STREAMING_0_5B) {
         // Load .bin voice presets
         if (!fs::exists(cfg_.voicesDir)) {
-            fprintf(stderr, "TTSPipeline: voices dir not found: %s\n", cfg_.voicesDir.c_str());
+            LOG_ERROR("TTS", "voices dir not found: %s", cfg_.voicesDir.c_str());
             return false;
         }
         for (auto& entry : fs::directory_iterator(cfg_.voicesDir)) {
@@ -193,18 +207,18 @@ bool TTSPipeline::loadVoicePresets() {
                 VoicePreset vp;
                 if (loadVoicePreset(entry.path().string(), vp)) {
                     voicePresets_[name] = std::move(vp);
-                    fprintf(stderr, "TTSPipeline: loaded voice '%s' (%u groups)\n",
-                            name.c_str(), voicePresets_[name].num_groups);
+                    LOG_INFO("TTS", "loaded voice '%s' (%u groups)",
+                             name.c_str(), voicePresets_[name].num_groups);
                 }
             }
         }
         if (voicePresets_.empty()) {
-            fprintf(stderr, "TTSPipeline: warning - no voice presets found\n");
+            LOG_WARN("TTS", "no voice presets found");
         }
     } else {
         // Load .wav voice file paths
         if (!fs::exists(cfg_.voicesDir)) {
-            fprintf(stderr, "TTSPipeline: voices dir not found: %s\n", cfg_.voicesDir.c_str());
+            LOG_ERROR("TTS", "voices dir not found: %s", cfg_.voicesDir.c_str());
             return false;
         }
         for (auto& entry : fs::directory_iterator(cfg_.voicesDir)) {
@@ -213,7 +227,7 @@ bool TTSPipeline::loadVoicePresets() {
                 voiceFiles_[name] = entry.path().string();
             }
         }
-        fprintf(stderr, "TTSPipeline: found %zu voice WAV files\n", voiceFiles_.size());
+        LOG_INFO("TTS", "found %zu voice WAV files", voiceFiles_.size());
     }
     return true;
 }
@@ -388,42 +402,33 @@ TTSPipeline::Result TTSPipeline::synth05B(const Request& req) {
                                 latentDim, stream_);
             // scratchLatent_ now has raw latent in fp16
 
-            // Denormalize for acoustic decoder
-            CudaBuffer denormLatent;
-            denormLatent.resize(latentDim * sizeof(uint16_t));
+            // Denormalize for acoustic decoder (reuse member buffers)
+            scratchDenormLatent_.resize(latentDim * sizeof(uint16_t));
             GpuOps::scaleAndBias(scratchLatent_.as<__half>(), speechScalingFactor_,
-                                 speechBiasFactor_, denormLatent.as<__half>(),
+                                 speechBiasFactor_, scratchDenormLatent_.as<__half>(),
                                  latentDim, stream_);
 
             // d. Acoustic decoder: latent [1, 64, 1] -> audio [1, 1, 3200]
-            CudaBuffer decoderInput;
-            decoderInput.resize(64 * 1 * sizeof(uint16_t));
+            scratchDecoderInput_.resize(64 * 1 * sizeof(uint16_t));
             // The decoder expects [1, 64, T] where T=1 for single token
-            cudaMemcpyAsync(decoderInput.data(), denormLatent.data(),
+            cudaMemcpyAsync(scratchDecoderInput_.data(), scratchDenormLatent_.data(),
                             64 * sizeof(uint16_t), cudaMemcpyDeviceToDevice, stream_);
 
             acousticDecoder_.setInputShape("latent", nvinfer1::Dims3{1, 64, 1});
-            acousticDecoder_.setTensorAddress("latent", decoderInput.data());
+            acousticDecoder_.setTensorAddress("latent", scratchDecoderInput_.data());
             // Output: audio [1, 1, hop_length]
             int hopLen = meta_.hop_length;  // 3200
-            CudaBuffer audioChunkGpu;
-            audioChunkGpu.resize(1 * 1 * hopLen * sizeof(uint16_t));
-            acousticDecoder_.setTensorAddress("audio", audioChunkGpu.data());
+            scratchAudioChunk_.resize(1 * 1 * hopLen * sizeof(uint16_t));
+            acousticDecoder_.setTensorAddress("audio", scratchAudioChunk_.data());
             acousticDecoder_.enqueueV3(stream_);
 
-            // Download audio chunk
-            std::vector<uint16_t> audioFp16(hopLen);
-            audioChunkGpu.copyToHost(audioFp16.data(), hopLen * sizeof(uint16_t));
-
-            // Convert fp16 -> fp32
+            // Convert fp16 -> fp32 (reuse member buffer)
             std::vector<float> audioChunk(hopLen);
-            // Use GPU conversion for consistency
-            CudaBuffer audioF32Gpu;
-            audioF32Gpu.resize(hopLen * sizeof(float));
-            GpuOps::halfToFloat(audioChunkGpu.as<__half>(), audioF32Gpu.as<float>(),
+            scratchAudioF32_.resize(hopLen * sizeof(float));
+            GpuOps::halfToFloat(scratchAudioChunk_.as<__half>(), scratchAudioF32_.as<float>(),
                                 hopLen, stream_);
             cudaStreamSynchronize(stream_);
-            audioF32Gpu.copyToHost(audioChunk.data(), hopLen * sizeof(float));
+            scratchAudioF32_.copyToHost(audioChunk.data(), hopLen * sizeof(float));
 
             allAudio.insert(allAudio.end(), audioChunk.begin(), audioChunk.end());
 
@@ -534,10 +539,9 @@ std::vector<float> TTSPipeline::sampleSpeechTokens(
         std::copy(sample.begin(), sample.end(), sampleDup.begin());
         std::copy(sample.begin(), sample.end(), sampleDup.begin() + latentDim);
 
-        CudaBuffer sampleF32Gpu;
-        sampleF32Gpu.resize(2 * latentDim * sizeof(float));
-        sampleF32Gpu.copyFromHostAsync(sampleDup.data(), sampleDup.size() * sizeof(float), stream_);
-        GpuOps::floatToHalf(sampleF32Gpu.as<float>(), scratchNoisy_.as<__half>(),
+        scratchSampleF32_.resize(2 * latentDim * sizeof(float));
+        scratchSampleF32_.copyFromHostAsync(sampleDup.data(), sampleDup.size() * sizeof(float), stream_);
+        GpuOps::floatToHalf(scratchSampleF32_.as<float>(), scratchNoisy_.as<__half>(),
                             2 * latentDim, stream_);
 
         // Timesteps: [t, t] int64
@@ -556,12 +560,11 @@ std::vector<float> TTSPipeline::sampleSpeechTokens(
         diffusionHead_.enqueueV3(stream_);
 
         // Download v_prediction [2, 64] fp16 -> fp32
-        CudaBuffer vpredF32Gpu;
-        vpredF32Gpu.resize(2 * latentDim * sizeof(float));
-        GpuOps::halfToFloat(scratchVpred_.as<__half>(), vpredF32Gpu.as<float>(),
+        scratchVpredF32_.resize(2 * latentDim * sizeof(float));
+        GpuOps::halfToFloat(scratchVpred_.as<__half>(), scratchVpredF32_.as<float>(),
                             2 * latentDim, stream_);
         cudaStreamSynchronize(stream_);
-        vpredF32Gpu.copyToHost(vpredF32.data(), vpredF32.size() * sizeof(float));
+        scratchVpredF32_.copyToHost(vpredF32.data(), vpredF32.size() * sizeof(float));
 
         // CFG blend: blended = uncond + scale * (cond - uncond)
         std::vector<float> blended(latentDim);
@@ -607,28 +610,25 @@ void TTSPipeline::runConnector(const __half* latentGpu, __half* outputGpu,
 float TTSPipeline::runEosClassifier(const __half* hiddenGpu) {
     int H = eosHiddenSize_;
 
-    // fc1 + ReLU
-    CudaBuffer fc1Out;
-    fc1Out.resize(H * sizeof(uint16_t));
+    // fc1 + ReLU (reuse member buffers)
+    scratchEosHidden_.resize(H * sizeof(uint16_t));
     GpuOps::linearForward(cublas_, hiddenGpu,
                           eosFc1W_.as<__half>(), eosFc1B_.as<__half>(),
-                          fc1Out.as<__half>(), H, H, stream_);
-    GpuOps::relu(fc1Out.as<__half>(), fc1Out.as<__half>(), H, stream_);
+                          scratchEosHidden_.as<__half>(), H, H, stream_);
+    GpuOps::relu(scratchEosHidden_.as<__half>(), scratchEosHidden_.as<__half>(), H, stream_);
 
     // fc2 + sigmoid -> scalar
-    CudaBuffer fc2Out;
-    fc2Out.resize(1 * sizeof(uint16_t));
-    GpuOps::linearForward(cublas_, fc1Out.as<__half>(),
+    scratchEosOut_.resize(1 * sizeof(uint16_t));
+    GpuOps::linearForward(cublas_, scratchEosHidden_.as<__half>(),
                           eosFc2W_.as<__half>(), eosFc2B_.as<__half>(),
-                          fc2Out.as<__half>(), 1, H, stream_);
+                          scratchEosOut_.as<__half>(), 1, H, stream_);
 
-    CudaBuffer sigmoidOut;
-    sigmoidOut.resize(sizeof(float));
-    GpuOps::sigmoid(fc2Out.as<__half>(), sigmoidOut.as<float>(), 1, stream_);
+    scratchEosSigmoid_.resize(sizeof(float));
+    GpuOps::sigmoid(scratchEosOut_.as<__half>(), scratchEosSigmoid_.as<float>(), 1, stream_);
 
     float score = 0.0f;
     cudaStreamSynchronize(stream_);
-    sigmoidOut.copyToHost(&score, sizeof(float));
+    scratchEosSigmoid_.copyToHost(&score, sizeof(float));
     return score;
 }
 
