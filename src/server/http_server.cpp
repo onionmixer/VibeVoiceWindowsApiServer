@@ -208,21 +208,6 @@ void HttpServer::sendError(httplib::Response& res, int status,
     res.set_content(err.dump(), "application/json");
 }
 
-std::string HttpServer::mapVoiceName(const std::string& name) const {
-    // OpenAI voice names -> VibeVoice presets
-    static const std::unordered_map<std::string, std::string> voiceMap = {
-        {"alloy",   "en-Carter_man"},
-        {"echo",    "en-Frank_man"},
-        {"fable",   "en-Davis_man"},
-        {"onyx",    "en-Mike_man"},
-        {"nova",    "en-Emma_woman"},
-        {"shimmer", "en-Grace_woman"},
-    };
-    auto it = voiceMap.find(name);
-    if (it != voiceMap.end()) return it->second;
-    return name;  // pass through as-is (direct preset name)
-}
-
 std::string HttpServer::mapModelName(const std::string& name) const {
     if (name == "tts-1" || name == "tts_0.5b" || name == "vibevoice-0.5b" || name == "tts-1-1106") return "tts_0.5b";
     if (name == "tts-1-hd" || name == "tts_1.5b" || name == "vibevoice-1.5b" || name == "tts-1-hd-1106") return "tts_1.5b";
@@ -330,9 +315,8 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
     LOG_INFO("HTTP", "POST /v1/audio/speech model=%s voice=%s format=%s",
              modelName.c_str(), voice.c_str(), responseFormat.c_str());
 
-    // Map names
+    // Map model name
     std::string mapped = mapModelName(modelName);
-    std::string voiceMapped = mapVoiceName(voice);
 
     // Select pipeline
     TTSPipeline* pipeline = nullptr;
@@ -355,6 +339,25 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
         return;
     }
 
+    // Resolve voice via pipeline's 4-stage fallback
+    std::string resolvedVoice = pipeline->resolveVoice(voice);
+    if (resolvedVoice.empty()) {
+        auto voices = pipeline->availableVoices();
+        std::string voiceList;
+        for (size_t i = 0; i < voices.size(); ++i) {
+            if (i > 0) voiceList += ", ";
+            voiceList += voices[i];
+        }
+        sendError(res, 400,
+            "Voice '" + voice + "' not found. Available: " + voiceList,
+            "invalid_request_error");
+        Logger::clearRequestId();
+        return;
+    }
+    if (resolvedVoice != voice) {
+        LOG_INFO("HTTP", "voice resolved: '%s' -> '%s'", voice.c_str(), resolvedVoice.c_str());
+    }
+
     // Synthesize with per-pipeline mutex + timeout
     auto& mtx = use05b ? tts05bMutex_ : tts15bMutex_;
     std::unique_lock<std::timed_mutex> lock(mtx, std::defer_lock);
@@ -367,7 +370,7 @@ void HttpServer::handleSpeech(const httplib::Request& req, httplib::Response& re
     TTSPipeline::Result result;
     {
         LOG_TIMER("HTTP", "speech synthesis");
-        result = pipeline->synthesize({input, voiceMapped, speed});
+        result = pipeline->synthesize({input, resolvedVoice, speed});
     }
 
     if (!result.ok) {

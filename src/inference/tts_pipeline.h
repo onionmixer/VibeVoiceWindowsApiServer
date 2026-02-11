@@ -51,6 +51,8 @@ public:
     bool load(const Config& cfg);
     Result synthesize(const Request& req);
     std::vector<std::string> availableVoices() const;
+    // 4-stage fallback voice resolution (exact -> alias -> substring -> first available)
+    std::string resolveVoice(const std::string& voice) const;
     bool isLoaded() const { return loaded_; }
 
 private:

@@ -72,7 +72,6 @@ private:
     void sendError(httplib::Response& res, int status,
                    const std::string& message, const std::string& type = "invalid_request_error",
                    const std::string& code = "");
-    std::string mapVoiceName(const std::string& name) const;
     std::string mapModelName(const std::string& name) const;
 
     ServerConfig cfg_;

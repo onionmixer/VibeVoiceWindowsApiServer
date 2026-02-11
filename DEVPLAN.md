@@ -310,6 +310,7 @@ public:
     bool load(const Config& cfg);
     Result synthesize(const Request& req);
     std::vector<std::string> availableVoices() const;
+    std::string resolveVoice(const std::string& voice) const;  // 4-stage fallback voice resolution
 private:
     Result synth05B(const Request& req);   // 0.5B: split LM + binary voice presets
     Result synth15B(const Request& req);   // 1.5B: unified LM + WAV voice + semantic feedback
@@ -676,7 +677,31 @@ build\release\vibevoice_server.exe --config config.json
 **0.5B**: carter, davis, emma, frank, grace, mike, samuel (+ 다국어 18종) — `.bin` binary KV-cache preset
 **1.5B**: 9개 WAV 파일 (예: en-Carter_man, en-Maya_woman 등) — `.wav` 참조 음성
 
-**OpenAI aliases**: alloy→carter, echo→frank, fable→emma/alice, onyx→davis/carter, nova→grace/maya, shimmer→emma/alice
+### Voice Resolution (4-Stage Fallback)
+
+`TTSPipeline::resolveVoice()` 가 Python 레퍼런스(`tts_service.py`)와 동일한 4단계 fallback을 구현한다.
+음성 키는 로드 시 **소문자**로 정규화하여 저장된다 (예: `en-Carter_man.wav` → `en-carter_man`).
+
+| 단계 | 방식 | 설명 |
+|------|------|------|
+| 1 | 직접 매치 | 입력을 소문자로 변환 후 정확 일치 검색 |
+| 2 | OpenAI 별칭 | `alloy→carter`, `echo→wayne` 등 6개 별칭을 내부 이름으로 변환 후 substring 매치 |
+| 3 | 부분 매치 | 입력이 키에 포함되거나 키가 입력에 포함되면 매치 (예: `maya` → `en-maya_woman`) |
+| 4 | Fallback | 위 단계 모두 실패 시 첫 번째 가용 음성 반환 |
+
+**OpenAI 별칭 매핑**: alloy→carter, echo→wayne, fable→carter, onyx→wayne, nova→carter, shimmer→wayne
+
+**매칭 예시:**
+
+| 요청 voice | 결과 (1.5B) | 매치 단계 |
+|-----------|-------------|----------|
+| `en-carter_man` | `en-carter_man` | 1단계 직접 |
+| `maya` | `en-maya_woman` | 3단계 부분 |
+| `alloy` | `en-carter_man` | 2단계 별칭 |
+| `carter` | `en-carter_man` | 3단계 부분 |
+| `unknown_xyz` | (첫 번째 음성) | 4단계 fallback |
+
+음성 미발견 시 HTTP 400 에러를 반환하며, 사용 가능한 음성 목록을 에러 메시지에 포함한다.
 
 ---
 

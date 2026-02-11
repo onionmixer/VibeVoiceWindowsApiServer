@@ -5,8 +5,16 @@
 #include <cmath>
 #include <random>
 #include <filesystem>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
+
+static std::string toLower(const std::string& s) {
+    std::string result = s;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return result;
+}
 
 // Diagnostic: download a GPU fp16 buffer and log value range
 static void diagLogFp16(const char* label, const __half* gpuPtr, int n, cudaStream_t stream) {
@@ -268,7 +276,7 @@ bool TTSPipeline::loadVoicePresets() {
         }
         for (auto& entry : fs::directory_iterator(cfg_.voicesDir)) {
             if (entry.path().extension() == ".bin") {
-                std::string name = entry.path().stem().string();
+                std::string name = toLower(entry.path().stem().string());
                 VoicePreset vp;
                 if (loadVoicePreset(entry.path().string(), vp)) {
                     voicePresets_[name] = std::move(vp);
@@ -288,7 +296,7 @@ bool TTSPipeline::loadVoicePresets() {
         }
         for (auto& entry : fs::directory_iterator(cfg_.voicesDir)) {
             if (entry.path().extension() == ".wav") {
-                std::string name = entry.path().stem().string();
+                std::string name = toLower(entry.path().stem().string());
                 voiceFiles_[name] = entry.path().string();
             }
         }
@@ -306,6 +314,53 @@ std::vector<std::string> TTSPipeline::availableVoices() const {
     }
     std::sort(names.begin(), names.end());
     return names;
+}
+
+std::string TTSPipeline::resolveVoice(const std::string& input) const {
+    std::string voice = toLower(input);
+
+    // Helper: get reference to the appropriate voice map
+    auto getKeys = [&]() -> std::vector<std::string> {
+        std::vector<std::string> keys;
+        if (type_ == ModelType::STREAMING_0_5B) {
+            for (auto& [k, _] : voicePresets_) keys.push_back(k);
+        } else {
+            for (auto& [k, _] : voiceFiles_) keys.push_back(k);
+        }
+        return keys;
+    };
+
+    auto keys = getKeys();
+
+    // Stage 1: exact match (lowercase)
+    for (auto& k : keys) {
+        if (k == voice) return k;
+    }
+
+    // Stage 2: OpenAI alias mapping -> substring match with alias target
+    static const std::unordered_map<std::string, std::string> aliasMap = {
+        {"alloy", "carter"}, {"echo", "wayne"},
+        {"fable", "carter"}, {"onyx", "wayne"},
+        {"nova", "carter"},  {"shimmer", "wayne"},
+    };
+    auto ait = aliasMap.find(voice);
+    if (ait != aliasMap.end()) {
+        for (auto& k : keys) {
+            if (k.find(ait->second) != std::string::npos)
+                return k;
+        }
+    }
+
+    // Stage 3: substring match (voice in key OR key in voice)
+    for (auto& k : keys) {
+        if (k.find(voice) != std::string::npos || voice.find(k) != std::string::npos)
+            return k;
+    }
+
+    // Stage 4: first available voice (fallback)
+    if (!keys.empty()) return keys.front();
+
+    return "";  // no voices available
 }
 
 // ── Synthesis dispatch ──

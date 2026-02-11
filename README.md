@@ -461,7 +461,8 @@ curl -X POST http://localhost:8899/v1/audio/speech ^
 | 스크립트 | 용도 |
 |----------|------|
 | `start_server.ps1` | 서버를 백그라운드 프로세스로 시작 (PATH 설정, 엔진 로딩 대기, 상태 확인 포함) |
-| `run_5tests_curl.ps1` | 5개 언어(영/일/중/한/혼합) TTS 테스트 실행 (서버 가동 상태에서 실행) |
+| `run_5tests_curl.ps1` | 5개 언어(영/일/중/한/혼합) TTS 테스트 실행 (별도 JSON 파일 필요) |
+| `test_tts_multilang.ps1` | 다국어 TTS 통합 테스트 (자체 완결형, JSON 자동 생성, API/모델/음성 파라미터 지원) |
 
 **서버 시작:**
 ```powershell
@@ -506,13 +507,19 @@ Request body:
 |-------|------|---------|-------------|
 | `model` | string | required | `vibevoice-0.5b` (streaming) or `vibevoice-1.5b` (full quality) |
 | `input` | string | required | Text to synthesize |
-| `voice` | string | `"alloy"` | Voice name (see voices endpoint). OpenAI aliases supported. |
+| `voice` | string | `"alloy"` | Voice name — supports exact name, OpenAI aliases, partial match, and auto-fallback (see below) |
 | `response_format` | string | `"wav"` | `wav`, `pcm`, `mp3`, `opus`, `aac`, `flac` |
 | `speed` | float | `1.0` | Speech speed multiplier |
 
 Response: binary audio in the requested format.
 
-**OpenAI voice aliases**: alloy, echo, fable, onyx, nova, shimmer are mapped to native voices.
+**Voice Resolution (4-stage fallback):**
+Voice names are resolved using a 4-stage fallback matching Python reference behavior:
+
+1. **Exact match** (case-insensitive): `en-Carter_man` → `en-carter_man`
+2. **OpenAI alias**: `alloy` → `carter` → `en-carter_man` (aliases: alloy/echo/fable/onyx/nova/shimmer)
+3. **Partial match** (substring): `maya` → `en-maya_woman`, `carter` → `en-carter_man`
+4. **Fallback**: unrecognized voice → first available voice
 
 **Note**: `mp3`, `opus`, `aac`, `flac` formats require `ffmpeg.exe` in the `tools/` directory.
 
@@ -634,8 +641,13 @@ VibeVoiceServer\
 │   └── ffmpeg.exe                Required for mp3/opus/aac/flac output
 │
 ├── start_server.ps1              서버 시작 스크립트 (PowerShell)
-├── run_5tests_curl.ps1           5개 언어 TTS 테스트 스크립트
+├── run_5tests_curl.ps1           5개 언어 TTS 테스트 (별도 JSON 파일 사용)
+├── test_tts_multilang.ps1        다국어 TTS 통합 테스트 (자체 완결형)
 ├── test_en.json                  테스트 입력 데이터 (en/ja/zh/ko/mixed)
+│
+├── tts_output\                   테스트 출력 (test_tts_multilang.ps1 생성)
+│   ├── test_*.json               테스트 요청 JSON (디버깅용)
+│   └── test_*.wav                생성된 음성 파일
 │
 ├── onnx\                         ONNX models (intermediate, can be deleted after engine build)
 │   ├── tts_0.5b\
