@@ -160,6 +160,18 @@ bool TRTEngine::enumerateTensors() {
         info.dataType = engine_->getTensorDataType(name);
         info.ioMode = engine_->getTensorIOMode(name);
 
+        const char* dtStr = "?";
+        switch (info.dataType) {
+            case nvinfer1::DataType::kFLOAT: dtStr = "fp32"; break;
+            case nvinfer1::DataType::kHALF:  dtStr = "fp16"; break;
+            case nvinfer1::DataType::kINT8:  dtStr = "int8"; break;
+            case nvinfer1::DataType::kINT32: dtStr = "int32"; break;
+            case nvinfer1::DataType::kBOOL:  dtStr = "bool"; break;
+            default: break;
+        }
+        const char* ioStr = (info.ioMode == nvinfer1::TensorIOMode::kINPUT) ? "IN" : "OUT";
+        LOG_DEBUG("TRT", "  tensor %-30s  %s  %s", name, ioStr, dtStr);
+
         tensorIndex_[info.name] = tensors_.size();
         tensors_.push_back(std::move(info));
     }
@@ -186,4 +198,12 @@ bool TRTEngine::setTensorAddress(const std::string& name, void* devicePtr) {
 bool TRTEngine::enqueueV3(cudaStream_t stream) {
     if (!context_) return false;
     return context_->enqueueV3(stream);
+}
+
+nvinfer1::Dims TRTEngine::getOutputShape(const std::string& name) const {
+    nvinfer1::Dims d{};
+    if (context_) {
+        d = context_->getTensorShape(name.c_str());
+    }
+    return d;
 }

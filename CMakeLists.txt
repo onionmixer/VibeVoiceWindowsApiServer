@@ -32,7 +32,7 @@ file(GLOB_RECURSE CUDA_SOURCES src/*.cu)
 if(CUDA_SOURCES)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_ARCHITECTURES "86;89;90")
+    set(CMAKE_CUDA_ARCHITECTURES "86")
 endif()
 
 # ── Sources ──

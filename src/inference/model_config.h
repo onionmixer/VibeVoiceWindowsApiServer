@@ -27,6 +27,7 @@ struct ModelMetadata {
     double rope_theta = 0.0;
     double rms_norm_eps = 0.0;
     int acoustic_vae_dim = 0;
+    int semantic_vae_dim = 0;
     int sample_rate = 0;
     int hop_length = 0;
 

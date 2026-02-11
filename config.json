@@ -5,26 +5,26 @@
     },
     "models": {
         "tts_0.5b": {
-            "enabled": true,
+            "enabled": false,
             "engine_dir": "engines/tts_0.5b",
-            "weights_dir": "engines/tts_0.5b",
-            "metadata_path": "engines/tts_0.5b/metadata.json",
+            "weights_dir": "engines/tts_0.5b/weights",
+            "metadata_path": "engines/tts_0.5b/model_metadata.json",
             "voices_dir": "voices/streaming_model",
             "tokenizer_path": "tokenizer/qwen2.5-0.5b/tokenizer.json",
             "special_tokens_path": "tokenizer/qwen2.5-0.5b/special_tokens.json",
             "cfg_scale": 1.5,
-            "inference_steps": 5
+            "inference_steps": 20
         },
         "tts_1.5b": {
-            "enabled": false,
+            "enabled": true,
             "engine_dir": "engines/tts_1.5b",
-            "weights_dir": "engines/tts_1.5b",
-            "metadata_path": "engines/tts_1.5b/metadata.json",
+            "weights_dir": "engines/tts_1.5b/weights",
+            "metadata_path": "engines/tts_1.5b/model_metadata.json",
             "voices_dir": "voices/full_model",
             "tokenizer_path": "tokenizer/qwen2.5-1.5b/tokenizer.json",
             "special_tokens_path": "tokenizer/qwen2.5-1.5b/special_tokens.json",
-            "cfg_scale": 1.3,
-            "inference_steps": 10
+            "cfg_scale": 3.0,
+            "inference_steps": 20
         },
         "asr": {
             "enabled": false,

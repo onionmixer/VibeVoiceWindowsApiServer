@@ -42,14 +42,15 @@ Edit `config.json` to match your setup. Key settings:
 {
     "server": { "host": "0.0.0.0", "port": 8080 },
     "models": {
-        "tts_0.5b": { "enabled": true,  "engine_dir": "engines/tts_0.5b", ... },
-        "tts_1.5b": { "enabled": false, ... },
+        "tts_0.5b": { "enabled": true,  "engine_dir": "engines/tts_0.5b", "cfg_scale": 1.5, "inference_steps": 20, ... },
+        "tts_1.5b": { "enabled": true,  "engine_dir": "engines/tts_1.5b", "cfg_scale": 3.0, "inference_steps": 20, ... },
         "asr":      { "enabled": false, ... }
     }
 }
 ```
 
 Set `"enabled": true` only for models whose TensorRT engines are built and available.
+Each model requires `engine_dir`, `weights_dir`, `metadata_path`, `voices_dir`, `tokenizer_path`, and `special_tokens_path`.
 
 ### 3. Run
 
@@ -71,9 +72,9 @@ Content-Type: application/json
 Request body:
 ```json
 {
-    "model": "tts_0.5b",
+    "model": "vibevoice-1.5b",
     "input": "Hello, world!",
-    "voice": "alloy",
+    "voice": "en-Carter_man",
     "response_format": "wav",
     "speed": 1.0
 }
@@ -81,9 +82,9 @@ Request body:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `"tts_0.5b"` | `tts_0.5b` or `tts_1.5b` |
+| `model` | string | required | `vibevoice-0.5b` (streaming) or `vibevoice-1.5b` (full quality) |
 | `input` | string | required | Text to synthesize |
-| `voice` | string | `"alloy"` | Voice name (see voices endpoint) |
+| `voice` | string | `"alloy"` | Voice name (see voices endpoint). OpenAI aliases supported. |
 | `response_format` | string | `"wav"` | `wav`, `pcm`, `mp3`, `opus`, `aac`, `flac` |
 | `speed` | float | `1.0` | Speech speed multiplier |
 
@@ -176,11 +177,11 @@ Creates a `dist\VibeVoiceServer\` directory with the executable, config, and dir
 VibeVoiceServer\
 ├── vibevoice_server.exe     Server executable
 ├── config.json              Server configuration
-├── engines\                 TensorRT engines (user-built)
-│   ├── tts_0.5b\            0.5B streaming TTS engines
-│   ├── tts_1.5b\            1.5B full-quality TTS engines
+├── engines\                 TensorRT engines + weights (user-built)
+│   ├── tts_0.5b\            0.5B streaming TTS (6 engines + weights/)
+│   ├── tts_1.5b\            1.5B full-quality TTS (6 engines + weights/)
 │   └── asr\                 ASR engines
-├── onnx\                    ONNX models (intermediate, optional)
+├── onnx\                    ONNX models (intermediate, build-time only)
 │   ├── tts_0.5b\
 │   ├── tts_1.5b\
 │   └── asr\
@@ -195,11 +196,11 @@ VibeVoiceServer\
 
 ## Supported Models
 
-| Model | Parameters | Use Case | VRAM |
-|-------|-----------|----------|------|
-| VibeVoice-Realtime-0.5B | 0.5B | Low-latency streaming TTS | ~2 GB |
-| VibeVoice-1.5B | 1.5B | High-quality TTS | ~6 GB |
-| VibeVoice-ASR | 7B | Speech recognition / translation | ~16 GB |
+| Model | API Name | Parameters | Use Case | VRAM |
+|-------|----------|-----------|----------|------|
+| VibeVoice-Realtime-0.5B | `vibevoice-0.5b` | 0.5B | Low-latency streaming TTS | ~2 GB |
+| VibeVoice-1.5B | `vibevoice-1.5b` | 1.5B | High-quality TTS | ~4 GB |
+| VibeVoice-ASR | `whisper-1` | 7B | Speech recognition / translation | ~16 GB |
 
 ## License
 

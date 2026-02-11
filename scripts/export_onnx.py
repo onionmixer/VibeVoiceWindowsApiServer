@@ -131,32 +131,44 @@ def _build_kv_cache(past_kv_flat, num_layers):
 
 class LMPrefillWrapper(nn.Module):
     """Wraps Qwen2ForCausalLM-style model for prefill (no KV-cache input).
-    Input: inputs_embeds [B, S, H], position_ids [B, S]
+    Input: inputs_embeds [B, S, H], position_ids [B, S], attention_mask [B, 1, S, S]
     Output: logits [B, S, V], hidden_states [B, S, H], kv_cache (list of key/value tensors)
     Used for models that have lm_head (1.5B TTS, ASR).
+
+    attention_mask is a 4D float additive mask: 0.0 = attend, large negative = block.
+    Passing a 4D mask causes Qwen2Model._update_causal_mask() to use it directly,
+    avoiding internal causal mask generation (which causes ONNX tracing issues).
     """
     def __init__(self, language_model, lm_head):
         super().__init__()
         self.language_model = language_model
         self.lm_head = lm_head
 
-    def forward(self, inputs_embeds, position_ids):
+    def forward(self, inputs_embeds, position_ids, attention_mask):
+        # Cast mask to model dtype (FP16) — SDPA requires mask to match query dtype.
+        # The ONNX input stays FP32, so a Cast(FP32->FP16) node will appear in the graph.
+        attention_mask = attention_mask.to(inputs_embeds.dtype)
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             use_cache=True,
         )
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
+        # Cast logits to FP32 so TRT engine outputs FP32 logits
+        logits = logits.float()
         kv_outputs = _extract_kv_cache(outputs.past_key_values)
         return (logits, hidden_states) + tuple(kv_outputs)
 
 
 class LMDecodeWrapper(nn.Module):
     """Wraps Qwen2ForCausalLM-style model for decode (with KV-cache).
-    Input: inputs_embeds [B, 1, H], position_ids [B, 1], past KV tensors
+    Input: inputs_embeds [B, 1, H], position_ids [B, 1], attention_mask [B, 1, 1, total_seq], past KV tensors
     Output: logits [B, 1, V], hidden_states [B, 1, H], updated KV tensors
     Used for models that have lm_head (1.5B TTS, ASR).
+
+    attention_mask is a 4D float additive mask: 0.0 = attend to all past+current.
     """
     def __init__(self, language_model, lm_head, num_layers, num_kv_heads, head_dim):
         super().__init__()
@@ -166,16 +178,21 @@ class LMDecodeWrapper(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
-    def forward(self, inputs_embeds, position_ids, *past_kv_flat):
+    def forward(self, inputs_embeds, position_ids, attention_mask, *past_kv_flat):
+        # Cast mask to model dtype (FP16) — SDPA requires mask to match query dtype.
+        attention_mask = attention_mask.to(inputs_embeds.dtype)
         past_key_values = _build_kv_cache(past_kv_flat, self.num_layers)
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True,
         )
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
+        # Cast logits to FP32 so TRT engine outputs FP32 logits
+        logits = logits.float()
         kv_outputs = _extract_kv_cache(outputs.past_key_values)
         return (logits, hidden_states) + tuple(kv_outputs)
 
@@ -580,26 +597,41 @@ def export_language_model_full(model, output_dir, model_type, config):
     print(f"  LM config: H={hidden_size}, L={num_layers}, KV_heads={num_kv_heads}, "
           f"head_dim={head_dim}, V={vocab_size}")
 
+    # Convert language model to FP16 on CUDA for export.
+    # This ensures RMS norm Cast(FP16->FP32) nodes are meaningful in the ONNX graph,
+    # so TRT will preserve them when building with --fp16 (preventing precision loss).
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    language_model = language_model.half().to(device)
+    lm_head = lm_head.half().to(device)
+    print(f"  LM converted to FP16 on {device} for ONNX export")
+
     # --- Prefill ---
     print(f"\n  Exporting prefill...")
     prefill_wrapper = LMPrefillWrapper(language_model, lm_head)
     prefill_wrapper.eval()
 
     seq_len = 16
-    dummy_embeds = torch.randn(1, seq_len, hidden_size)
-    dummy_pos_ids = torch.arange(seq_len).unsqueeze(0)
+    dummy_embeds = torch.randn(1, seq_len, hidden_size, dtype=torch.float16, device=device)
+    dummy_pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+    # 4D causal attention mask [1, 1, S, S]: 0.0 = attend, -3.4e38 = block
+    # Keep as FP32 — PyTorch will insert Cast nodes in the ONNX graph where needed
+    min_val = torch.finfo(torch.float32).min
+    dummy_prefill_mask = torch.full((1, 1, seq_len, seq_len), min_val, dtype=torch.float32, device=device)
+    dummy_prefill_mask = torch.triu(dummy_prefill_mask, diagonal=1)  # upper triangle = min_val, rest = 0
 
     kv_out_names = get_present_kv_names(num_layers)
 
     export_onnx_model(
         prefill_wrapper,
-        (dummy_embeds, dummy_pos_ids),
+        (dummy_embeds, dummy_pos_ids, dummy_prefill_mask),
         os.path.join(output_dir, "language_model_prefill.onnx"),
-        input_names=["inputs_embeds", "position_ids"],
+        input_names=["inputs_embeds", "position_ids", "attention_mask"],
         output_names=["logits", "hidden_states"] + kv_out_names,
         dynamic_axes={
             "inputs_embeds": {0: "batch", 1: "seq_len"},
             "position_ids": {0: "batch", 1: "seq_len"},
+            "attention_mask": {0: "batch", 2: "seq_len", 3: "seq_len"},
             "logits": {0: "batch", 1: "seq_len"},
             "hidden_states": {0: "batch", 1: "seq_len"},
             **{name: {0: "batch", 2: "seq_len"} for name in kv_out_names},
@@ -612,29 +644,35 @@ def export_language_model_full(model, output_dir, model_type, config):
     decode_wrapper.eval()
 
     past_seq_len = 16
-    dummy_embeds_1 = torch.randn(1, 1, hidden_size)
-    dummy_pos_ids_1 = torch.tensor([[past_seq_len]])
+    dummy_embeds_1 = torch.randn(1, 1, hidden_size, dtype=torch.float16, device=device)
+    dummy_pos_ids_1 = torch.tensor([[past_seq_len]], device=device)
 
-    # Create dummy past KV cache
+    # 4D decode attention mask [1, 1, 1, total_seq]: all 0.0 (attend to all past + current)
+    # Keep as FP32 for mask precision
+    total_seq = past_seq_len + 1
+    dummy_decode_mask = torch.zeros(1, 1, 1, total_seq, dtype=torch.float32, device=device)
+
+    # Create dummy past KV cache in FP16 (matching model dtype)
     dummy_past_kv = []
     for _ in range(num_layers):
-        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim))  # key
-        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim))  # value
+        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim, dtype=torch.float16, device=device))  # key
+        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim, dtype=torch.float16, device=device))  # value
 
     kv_in_names = get_lm_kv_names(num_layers)
     kv_present_names = get_present_kv_names(num_layers)
 
-    decode_inputs = (dummy_embeds_1, dummy_pos_ids_1) + tuple(dummy_past_kv)
+    decode_inputs = (dummy_embeds_1, dummy_pos_ids_1, dummy_decode_mask) + tuple(dummy_past_kv)
 
     export_onnx_model(
         decode_wrapper,
         decode_inputs,
         os.path.join(output_dir, "language_model_decode.onnx"),
-        input_names=["inputs_embeds", "position_ids"] + kv_in_names,
+        input_names=["inputs_embeds", "position_ids", "attention_mask"] + kv_in_names,
         output_names=["logits", "hidden_states"] + kv_present_names,
         dynamic_axes={
             "inputs_embeds": {0: "batch"},
             "position_ids": {0: "batch"},
+            "attention_mask": {0: "batch", 3: "total_seq_len"},
             "logits": {0: "batch"},
             "hidden_states": {0: "batch"},
             **{name: {0: "batch", 2: "past_seq_len"} for name in kv_in_names},

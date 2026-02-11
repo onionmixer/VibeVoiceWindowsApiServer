@@ -28,11 +28,19 @@ OpenAI-compatible REST API (TTS/STT) 를 제공한다.
 
 ## Architecture
 - TensorRT로 모델 추론 (safetensors → ONNX → TensorRT engine)
-- 5개 서브모델 분리: acoustic_encoder, semantic_encoder, language_model, diffusion_head, acoustic_decoder
+- 0.5B TTS: 6 engines (base_lm_prefill/decode, tts_lm_prefill/decode, diffusion_head, acoustic_decoder) — split LM, binary voice presets
+- 1.5B TTS: 6 engines (language_model_prefill/decode, acoustic_encoder, semantic_encoder, diffusion_head, acoustic_decoder) — unified LM, WAV voice, semantic feedback loop
+- 1.5B LM: FP16 ONNX (embeds/hidden fp16, logits/mask fp32), FP16 KV-cache (224MB/cache)
 - BPE Tokenizer (Qwen2) C++ 직접 구현
-- DPM-Solver (diffusion scheduler) C++ 구현
+- DPM-Solver++ (cosine schedule, v_prediction) C++ 구현
+- GPU 연산: cuBLAS (matMul, vectorAdd, RMSNorm, embedding lookup)
 - HTTP API: cpp-httplib 기반
 - Audio I/O: dr_libs (직접) + ffmpeg.exe subprocess (mp3/opus/aac/flac 변환)
+
+## Current Status
+- **0.5B TTS**: 동작 완료 (스트리밍)
+- **1.5B TTS**: 동작 완료 (풀 퀄리티, CFG=3.0, 20 diffusion steps)
+- **STT/ASR**: 코드 구현 완료, 엔진 미빌드
 
 ## Key Constraints
 1. C++로 제작

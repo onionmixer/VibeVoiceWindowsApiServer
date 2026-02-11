@@ -203,6 +203,7 @@ def get_shape_profiles(model_type: str, metadata: dict):
         prefill_shapes = {
             "inputs_embeds": (f"1x1x{H}", f"1x512x{H}", f"1x{max_seq}x{H}"),
             "position_ids": ("1x1", "1x512", f"1x{max_seq}"),
+            "attention_mask": ("1x1x1x1", "1x1x512x512", f"1x1x{max_seq}x{max_seq}"),
         }
         profiles["language_model_prefill"] = prefill_shapes
 
@@ -210,6 +211,7 @@ def get_shape_profiles(model_type: str, metadata: dict):
         decode_shapes = {
             "inputs_embeds": (f"1x1x{H}", f"1x1x{H}", f"1x1x{H}"),
             "position_ids": ("1x1", "1x1", "1x1"),
+            "attention_mask": ("1x1x1x2", f"1x1x1x513", f"1x1x1x{max_seq + 1}"),
         }
         for i in range(num_layers):
             decode_shapes[f"past_key_{i}"] = (

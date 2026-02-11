@@ -62,6 +62,9 @@ public:
     // Execute inference asynchronously on a CUDA stream.
     bool enqueueV3(cudaStream_t stream);
 
+    // Query actual output tensor shape after execution (for dynamic shapes).
+    nvinfer1::Dims getOutputShape(const std::string& name) const;
+
     // Check if engine is loaded.
     bool isLoaded() const { return engine_ != nullptr; }
 

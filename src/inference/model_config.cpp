@@ -67,6 +67,7 @@ bool loadModelMetadata(const std::string& jsonPath, ModelMetadata& out) {
     out.rope_theta = j.value("rope_theta", 0.0);
     out.rms_norm_eps = j.value("rms_norm_eps", 0.0);
     out.acoustic_vae_dim = j.value("acoustic_vae_dim", 0);
+    out.semantic_vae_dim = j.value("semantic_vae_dim", 0);
     out.sample_rate = j.value("sample_rate", 0);
     out.hop_length = j.value("hop_length", 0);
 

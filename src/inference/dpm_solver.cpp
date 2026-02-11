@@ -146,7 +146,8 @@ void DPMSolver::firstOrderUpdate(const float* x0, int stepIndex,
     float h = lambda_t - lambda_s;
 
     // DPM-Solver++ formula:
-    // x_t = (sigma_t / sigma_s) * sample + alpha_t * (1 - exp(h)) * x0
+    // x_t = (sigma_t / sigma_s) * sample + alpha_t * (1 - exp(-h)) * x0
+    // Note: h > 0 (going from noisy to clean), so exp(-h) < 1
     if (sigma_t < 1e-6f) {
         // Final step: fully denoised -> output = alpha_t * x0
         for (int i = 0; i < n; ++i) {
@@ -155,7 +156,7 @@ void DPMSolver::firstOrderUpdate(const float* x0, int stepIndex,
     } else {
         for (int i = 0; i < n; ++i) {
             float term1 = (sigma_t / sigma_s) * sample[i];
-            float term2 = alpha_t * (1.0f - expf(h)) * x0[i];
+            float term2 = alpha_t * (1.0f - expf(-h)) * x0[i];
             output[i] = term1 + term2;
         }
     }
@@ -163,15 +164,18 @@ void DPMSolver::firstOrderUpdate(const float* x0, int stepIndex,
 
 void DPMSolver::secondOrderUpdate(int stepIndex,
                                    const float* sample, float* output, int n) {
-    // DPM-Solver++ second order with midpoint correction
-    // Uses modelOutputs_[0] (D0, previous) and modelOutputs_[1] (D1, current)
+    // DPM-Solver++ second order (midpoint variant)
+    // Following diffusers DPMSolverMultistepScheduler exactly:
+    //   s0 = current step = stepIndex
+    //   s1 = previous step = stepIndex - 1
+    //   t  = target step = stepIndex + 1
 
-    int s = stepIndex - 1;  // previous step
+    // Current step (s0)
+    int t_s0 = timesteps_[stepIndex];
+    float ab_s0 = alphasCumprod_[t_s0];
+    float sigma_s0 = sqrtf(1.0f - ab_s0);
 
-    int t_s = timesteps_[s];
-    float ab_s = alphasCumprod_[t_s];
-    float sigma_s = sqrtf(1.0f - ab_s);
-
+    // Target step (t)
     float sigma_t, alpha_t;
     if (stepIndex + 1 < numInferenceSteps_) {
         int t_next = timesteps_[stepIndex + 1];
@@ -183,27 +187,33 @@ void DPMSolver::secondOrderUpdate(int stepIndex,
         sigma_t = 0.0f;
     }
 
-    float lambda_s = lambdas_[s];
-    float lambda_s1 = lambdas_[s + 1];
-    float lambda_t = lambdas_[stepIndex + 1];
-    float h = lambda_t - lambda_s;
-    float h_0 = lambda_s1 - lambda_s;
-    float r = h_0 / h;
+    float lambda_s0 = lambdas_[stepIndex];         // current
+    float lambda_s1 = lambdas_[stepIndex - 1];     // previous
+    float lambda_t  = lambdas_[stepIndex + 1];     // target
+    float h   = lambda_t  - lambda_s0;             // current step size
+    float h_0 = lambda_s0 - lambda_s1;             // previous step size
+    float r0 = h_0 / h;
 
-    // D0 = modelOutputs_[0], D1 = modelOutputs_[1] (both are x0 predictions)
-    const float* D0 = modelOutputs_[0].data();
-    const float* D1 = modelOutputs_[1].data();
+    // m1 = older x0 prediction, m0 = latest x0 prediction
+    const float* m1 = modelOutputs_[0].data();
+    const float* m0 = modelOutputs_[1].data();
 
     if (sigma_t < 1e-6f) {
-        // Final step: fully denoised -> output = alpha_t * D1
+        // Final step: fully denoised
         for (int i = 0; i < n; ++i) {
-            output[i] = alpha_t * D1[i];
+            output[i] = alpha_t * m0[i];
         }
     } else {
+        float exp_neg_h = expf(-h);
         for (int i = 0; i < n; ++i) {
-            float term1 = (sigma_t / sigma_s) * sample[i];
-            float term2 = alpha_t * (1.0f - expf(h)) * D1[i];
-            float term3 = 0.5f * alpha_t * (1.0f - expf(h)) * (1.0f / r) * (D1[i] - D0[i]);
+            // D0 = m0, D1 = (1/r0) * (m0 - m1)
+            float D0_val = m0[i];
+            float D1_val = (1.0f / r0) * (m0[i] - m1[i]);
+
+            // x_t = (sigma_t/sigma_s0)*sample - alpha_t*(exp(-h)-1)*D0 - 0.5*alpha_t*(exp(-h)-1)*D1
+            float term1 = (sigma_t / sigma_s0) * sample[i];
+            float term2 = -alpha_t * (exp_neg_h - 1.0f) * D0_val;
+            float term3 = -0.5f * alpha_t * (exp_neg_h - 1.0f) * D1_val;
             output[i] = term1 + term2 + term3;
         }
     }
@@ -231,7 +241,9 @@ void DPMSolver::step(const float* modelOutput, int stepIndex,
     }
 
     // Choose order based on history
-    if (solverOrder_ >= 2 && lowerOrderNums_ >= 1 && stepIndex > 0) {
+    // lower_order_final: use first order for the last step (matches diffusers default)
+    bool isLastStep = (stepIndex == numInferenceSteps_ - 1);
+    if (solverOrder_ >= 2 && lowerOrderNums_ >= 1 && stepIndex > 0 && !isLastStep) {
         secondOrderUpdate(stepIndex, sample, prevSample, n);
     } else {
         firstOrderUpdate(x0.data(), stepIndex, sample, prevSample, n);

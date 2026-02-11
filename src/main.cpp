@@ -24,6 +24,8 @@ static void signalHandler(int) {
 // ── Main ──
 
 int main(int argc, char* argv[]) {
+    setvbuf(stderr, NULL, _IONBF, 0);  // Make stderr unbuffered
+    Logger::instance().setLogFile("C:\\Users\\onion\\Desktop\\Workspace\\VibeVoiceWindowsApiServer\\server_debug.log");
     // Parse CLI args
     if (argc >= 2 && std::string(argv[1]) == "--test") {
         return runUnitTests();
@@ -40,7 +42,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << "=== VibeVoice Windows API Server ===" << std::endl;
+    std::cout << "=== VibeVoice Windows API Server === BUILD_V4" << std::endl;
 
     // CUDA info
     int cuda_runtime_ver = 0;

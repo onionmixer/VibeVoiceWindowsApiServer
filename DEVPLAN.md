@@ -71,15 +71,21 @@ NVIDIA CUDA/TensorRT만을 외부 의존성으로 사용하며, OpenAI-compatibl
 
 ### 2.2 Sub-Model Decomposition
 
-원본 monolithic 모델을 TensorRT용 **5개 서브모델**로 분리:
+원본 monolithic 모델을 TensorRT용 서브모델로 분리:
+
+**0.5B (6 engines)**: base_lm_prefill, base_lm_decode, tts_lm_prefill, tts_lm_decode, diffusion_head, acoustic_decoder
+**1.5B (6 engines)**: language_model_prefill, language_model_decode, acoustic_encoder, semantic_encoder, diffusion_head, acoustic_decoder
 
 | Sub-Model | Input | Output | Description |
 |-----------|-------|--------|-------------|
-| `acoustic_encoder` | `[B,1,N]` audio | `[B,T,64]` latent | 24kHz→64d latent @7.5Hz |
-| `semantic_encoder` | `[B,1,N]` audio | `[B,T,128]` semantic | 24kHz→128d semantic |
-| `language_model` | `[B,S]` tokens + KV-cache | `[B,S,V]` logits + KV-cache | Qwen2 Transformer |
+| `acoustic_encoder` | `[B,1,N]` audio | `[B,T,64]` latent | 24kHz→64d latent @7.5Hz (1.5B) |
+| `semantic_encoder` | `[B,1,N]` audio | `[B,128,T]` semantic | 24kHz→128d semantic (1.5B, channel-first) |
+| `language_model_prefill` | `[B,S,H]` embeds + mask | `[B,S,V]` logits + `[B,S,H]` hidden + KV | Qwen2 1.5B prefill (unified LM) |
+| `language_model_decode` | `[B,1,H]` embed + mask + KV | `[B,1,V]` logits + `[B,1,H]` hidden + KV | Qwen2 1.5B decode (unified LM) |
+| `base_lm_prefill/decode` | `[B,S]` tokens + KV-cache | `[B,S,H]` hidden + KV-cache | Qwen2 0.5B base LM (split) |
+| `tts_lm_prefill/decode` | `[B,S]` tokens + KV-cache | `[B,S,H]` hidden + KV-cache | Qwen2 0.5B TTS LM (split) |
 | `diffusion_head` | `[B,1,64]` noise + cond + t | `[B,1,64]` v_pred | Single denoise step |
-| `acoustic_decoder` | `[B,T,64]` latent | `[B,1,T*3200]` audio | 64d latent→24kHz audio |
+| `acoustic_decoder` | `[B,64,T]` latent | `[B,1,T*3200]` audio | 64d latent→24kHz audio |
 
 ### 2.3 Inference Pipelines
 
@@ -97,9 +103,26 @@ Concat chunks → WAV
 **TTS 1.5B (Full)**:
 ```
 Text → BPE → tokens
-Voice .wav → Acoustic Encoder → voice_latents
-tokens + voice_latents → LM (autoregressive) → semantic tokens
-semantic → DPM loop(10 steps) → latent → Acoustic Decoder → WAV
+Voice .wav → Acoustic Encoder → voice_latents [T, 64]
+  → normalize: (latent + bias) * scale
+  → Acoustic Connector: [T, 64] → [T, H] voice embeddings
+
+Prompt = [sys_tokens + speech_start + voice_embeds + speech_end + text_tokens + speech_start]
+Negative = [speech_start] (1 token for CFG)
+
+Prefill → KV-cache + initial logits
+
+Autoregressive loop:
+  logits = constrain to {speech_diffusion, speech_end, eos}
+  token = argmax(logits)
+  if speech_diffusion:
+    hidden_pos/neg → DPM loop(20 steps, CFG=3.0) → latent [64]
+    denorm: latent / scale - bias
+    decode latent → audio → Semantic Encoder → semantic [128]
+    Acoustic Connector(latent) + Semantic Connector(semantic) → next embedding
+  if speech_end/eos: stop
+
+Batch decode all latents → Acoustic Decoder → WAV
 ```
 
 **STT (ASR)**:
@@ -149,8 +172,8 @@ VibeVoiceWindowsApiServer/
 │   ├── qwen2.5-1.5b/tokenizer.json
 │   └── qwen2.5-7b/tokenizer.json
 ├── engines/                         ← TensorRT 엔진 (최초 1회 빌드)
-│   ├── tts_0.5b/  (4 engines)
-│   ├── tts_1.5b/  (5 engines)
+│   ├── tts_0.5b/  (6 engines + weights)
+│   ├── tts_1.5b/  (6 engines + weights)
 │   └── asr/       (3 engines)
 └── tools/
     └── ffmpeg.exe                   ← static build (mp3/opus/aac/flac 변환)
@@ -170,7 +193,7 @@ safetensors → [export_onnx.py] → ONNX → [build_engines.py / trtexec] → .
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/export_onnx.py` | 5개 서브모델을 개별 ONNX로 export |
+| `scripts/export_onnx.py` | 서브모델을 개별 ONNX로 export (0.5B: 6개, 1.5B: 6개) |
 | `scripts/build_engines.py` | ONNX → TensorRT engine 빌드 |
 | `scripts/convert_voices.py` | .pt (PyTorch KV-cache) → .bin (raw fp16) |
 | `scripts/prepare_tokenizer.py` | HuggingFace tokenizer 다운로드 + special tokens 추가 |
@@ -180,22 +203,28 @@ safetensors → [export_onnx.py] → ONNX → [build_engines.py / trtexec] → .
 ```python
 # acoustic_encoder: Conv1D stack (causal, depthwise)
 #   Input:  audio [B, 1, N]  dynamic N
-#   Output: latent [B, T, 64]
+#   Output: latent_mean [B, T, 64]
 
 # semantic_encoder: Conv1D stack
 #   Input:  audio [B, 1, N]
-#   Output: semantic [B, T, 128]
+#   Output: semantic_mean [B, 128, T]  (channel-first!)
 
-# language_model: Qwen2 Transformer with KV-cache
-#   Prefill: input_ids [B, S] → logits [B, S, V], kv_cache_out
-#   Decode:  input_ids [B, 1] + kv_cache_in → logits [B, 1, V], kv_cache_out
+# 1.5B language_model (unified Qwen2 with lm_head):
+#   Prefill: inputs_embeds [B, S, H], attention_mask [B, S] fp32
+#          → logits [B, S, V] fp32, hidden_states [B, S, H] fp16, kv_cache_out fp16
+#   Decode:  inputs_embeds [B, 1, H], attention_mask [B, S+1] fp32, kv_cache_in fp16
+#          → logits [B, 1, V] fp32, hidden_states [B, 1, H] fp16, kv_cache_out fp16
+
+# 0.5B language_model (split base_lm + tts_lm, no lm_head):
+#   Prefill: input_ids [B, S] → hidden_states [B, S, H] fp32, kv_cache_out fp32
+#   Decode:  input_ids [B, 1] + kv_cache_in → hidden_states [B, 1, H] fp32, kv_cache_out fp32
 
 # diffusion_head: single denoise step
 #   Input:  noisy [B, 1, 64], cond [B, 1, H], timestep [B]
 #   Output: v_prediction [B, 1, 64]
 
 # acoustic_decoder: TransposedConv1D stack
-#   Input:  latent [B, T, 64]
+#   Input:  latent [B, 64, T]  (channel-first)
 #   Output: audio [B, 1, T*3200]
 ```
 
@@ -224,31 +253,31 @@ Body:   fp16 key[layers][heads][seq][dim] + value[layers][heads][seq][dim]
 src/
 ├── main.cpp
 ├── server/
-│   ├── http_server.h/.cpp
-│   ├── routes_tts.h/.cpp
-│   ├── routes_stt.h/.cpp
-│   └── routes_health.h/.cpp
+│   └── http_server.h/.cpp         # cpp-httplib HTTP 서버 + 모든 라우트
 ├── inference/
 │   ├── trt_engine.h/.cpp          # TensorRT 엔진 로더/실행
-│   ├── tts_pipeline.h/.cpp        # TTS 파이프라인 오케스트레이션
+│   ├── tts_pipeline.h/.cpp        # TTS 파이프라인 (0.5B 스트리밍 + 1.5B 풀)
 │   ├── stt_pipeline.h/.cpp        # STT 파이프라인 오케스트레이션
-│   ├── dpm_solver.h/.cpp          # DPM-Solver 스케줄러
-│   ├── kv_cache.h/.cpp            # KV-cache GPU 메모리 관리
-│   └── model_config.h/.cpp        # 모델 config.json 파서
+│   ├── dpm_solver.h/.cpp          # DPM-Solver++ 스케줄러 (cosine, v_prediction)
+│   ├── kv_cache.h/.cpp            # KV-cache GPU 메모리 관리 (fp16/fp32)
+│   ├── gpu_ops.h                  # cuBLAS 기반 GPU 연산 (vectorAdd, matMul, RMSNorm 등)
+│   └── model_config.h/.cpp        # 모델 메타데이터 + 가중치 파서
 ├── tokenizer/
 │   ├── bpe_tokenizer.h/.cpp       # Qwen2 BPE (C++ 구현)
 │   ├── unicode_utils.h/.cpp       # UTF-8 처리
 │   └── special_tokens.h           # VibeVoice special token IDs
 ├── audio/
-│   ├── audio_io.h/.cpp            # WAV/MP3/FLAC/OGG 읽기쓰기
-│   ├── audio_convert.h/.cpp       # ffmpeg.exe subprocess 호출
-│   ├── audio_normalize.h/.cpp     # dB 정규화
-│   └── resampler.h/.cpp           # → 24kHz 변환
+│   ├── audio_io.h/.cpp            # WAV/MP3/FLAC/OGG 읽기쓰기 (dr_libs)
+│   ├── audio_convert.h/.cpp       # ffmpeg.exe subprocess 호출 (mp3/opus/aac/flac)
+│   └── audio_libs_impl.cpp        # dr_libs 헤더 구현체
+├── tests/
+│   ├── test_common.h              # 테스트 공통 유틸리티
+│   ├── tests_unit.cpp             # 유닛 테스트 (tokenizer, config 등)
+│   └── tests_e2e.cpp              # E2E 테스트 (HTTP 엔드포인트)
 └── utils/
-    ├── cuda_utils.h/.cpp          # CUDA 메모리/스트림 헬퍼
-    ├── safetensors.h/.cpp         # safetensors 파서 (voice용)
-    ├── thread_pool.h              # 요청 큐
-    └── logger.h/.cpp
+    ├── cuda_buffer.h/.cpp         # CudaBuffer RAII 래퍼
+    ├── cuda_check.h               # CUDA 에러 체크 매크로
+    └── logger.h/.cpp              # 구조화 로깅 (타임스탬프, 레벨, 모듈, 요청ID)
 ```
 
 ### 5.2 Core Classes
@@ -274,20 +303,20 @@ private:
 class TTSPipeline {
 public:
     enum class ModelType { STREAMING_0_5B, FULL_1_5B };
+    struct Config { ModelType type; std::string engineDir, weightsDir, voicesDir, ...; float cfgScale; int inferenceSteps; };
     struct Request  { std::string text, voice; float speed; };
-    struct Result   { std::vector<float> audio; int sample_rate; bool ok; std::string err; };
+    struct Result   { std::vector<float> audio; int sampleRate; bool ok; std::string error; };
 
-    explicit TTSPipeline(ModelType type, const ModelConfig& cfg);
-    bool load();
+    bool load(const Config& cfg);
     Result synthesize(const Request& req);
     std::vector<std::string> availableVoices() const;
 private:
-    Result synth_streaming(const Request& req);
-    Result synth_full(const Request& req);
-    std::unique_ptr<TRTEngine> ac_enc_, sem_enc_, lm_, diff_, ac_dec_;
-    std::map<std::string, CudaBuffer> voice_cache_;
-    std::unique_ptr<BPETokenizer> tok_;
-    std::unique_ptr<DPMSolver> dpm_;
+    Result synth05B(const Request& req);   // 0.5B: split LM + binary voice presets
+    Result synth15B(const Request& req);   // 1.5B: unified LM + WAV voice + semantic feedback
+    // Helpers: sampleSpeechTokens, runConnector, runEosClassifier, runLmPrefill, runLmDecodeWithLogits, ...
+    // 0.5B engines: baseLmPrefill_, baseLmDecode_, ttsLmPrefill_, ttsLmDecode_, diffusionHead_, acousticDecoder_
+    // 1.5B engines: lmPrefill_, lmDecode_, acousticEncoder_, semanticEncoder_, diffusionHead_, acousticDecoder_
+    // KV caches, GPU weights, scratch buffers, tokenizer, DPM solver, cuBLAS, ...
 };
 ```
 
@@ -356,19 +385,39 @@ public:
 
 ```json
 {
-    "server": { "host": "0.0.0.0", "port": 8080, "threads": 4 },
-    "device": { "gpu_id": 0, "dtype": "float16" },
+    "server": { "host": "0.0.0.0", "port": 8080 },
     "models": {
-        "asr":      { "enabled": true,  "engine_dir": "engines/asr",      "max_new_tokens": 32768, "temperature": 0.0 },
-        "tts_0_5b": { "enabled": true,  "engine_dir": "engines/tts_0.5b", "cfg_scale": 1.5, "inference_steps": 5,  "default_voice": "carter" },
-        "tts_1_5b": { "enabled": true,  "engine_dir": "engines/tts_1.5b", "cfg_scale": 1.3, "inference_steps": 10, "default_voice": "alice" }
+        "tts_0.5b": {
+            "enabled": true,
+            "engine_dir": "engines/tts_0.5b",
+            "weights_dir": "engines/tts_0.5b/weights",
+            "metadata_path": "engines/tts_0.5b/model_metadata.json",
+            "voices_dir": "voices/streaming_model",
+            "tokenizer_path": "tokenizer/qwen2.5-0.5b/tokenizer.json",
+            "special_tokens_path": "tokenizer/qwen2.5-0.5b/special_tokens.json",
+            "cfg_scale": 1.5, "inference_steps": 20
+        },
+        "tts_1.5b": {
+            "enabled": true,
+            "engine_dir": "engines/tts_1.5b",
+            "weights_dir": "engines/tts_1.5b/weights",
+            "metadata_path": "engines/tts_1.5b/model_metadata.json",
+            "voices_dir": "voices/full_model",
+            "tokenizer_path": "tokenizer/qwen2.5-1.5b/tokenizer.json",
+            "special_tokens_path": "tokenizer/qwen2.5-1.5b/special_tokens.json",
+            "cfg_scale": 3.0, "inference_steps": 20
+        },
+        "asr": {
+            "enabled": false,
+            "engine_dir": "engines/asr",
+            "max_new_tokens": 32768, "temperature": 0.0
+        }
     },
-    "paths": {
-        "voices_dir": "models/voices",
-        "tokenizer_dir": "tokenizer",
-        "ffmpeg": "tools/ffmpeg.exe"
-    },
-    "audio": { "sample_rate": 24000, "normalize_db": -25.0 }
+    "defaults": {
+        "tts_voice": "en-Carter_man",
+        "tts_model": "tts_0.5b",
+        "max_audio_duration": 600
+    }
 }
 ```
 
@@ -520,16 +569,17 @@ build\release\vibevoice_server.exe --config config.json
 - [x] main.cpp 스켈레톤
 
 ### Phase 1: Model Conversion Pipeline (3-5일)
-- [x] `export_onnx.py` — 5개 서브모델 ONNX export
-  - [x] Acoustic encoder
-  - [x] Semantic encoder
-  - [x] Language model (KV-cache)
+- [x] `export_onnx.py` — 서브모델 ONNX export
+  - [x] Acoustic encoder (0.5B, 1.5B)
+  - [x] Semantic encoder (1.5B)
+  - [x] Language model with KV-cache (0.5B: split base_lm/tts_lm, 1.5B: unified with lm_head)
   - [x] Diffusion head
   - [x] Acoustic decoder
+  - [x] 1.5B FP16 ONNX export (inputs_embeds/hidden_states fp16, logits/mask fp32)
 - [x] `build_engines.py` — ONNX → TensorRT
-- [x] `convert_voices.py` — .pt → .bin
+- [x] `convert_voices.py` — .pt → .bin (0.5B streaming voices)
 - [x] `prepare_tokenizer.py` — Qwen2 tokenizer 준비
-- [ ] ONNX output vs 원본 output 비교 검증
+- [x] ONNX output vs 원본 output 비교 검증 (0.5B, 1.5B 모두 동작 확인)
 
 ### Phase 2: Core C++ (3-4일)
 - [x] TRTEngine — 엔진 로더/실행
@@ -541,15 +591,22 @@ build\release\vibevoice_server.exe --config config.json
 
 ### Phase 3: TTS Pipeline (5-7일)
 - [x] 0.5B Streaming
-  - [x] Voice .bin 로드 → GPU
+  - [x] Voice .bin 로드 → GPU (KV-cache presets)
   - [x] Text → BPE → tokens
-  - [x] LM autoregressive (KV-cache)
-  - [x] DPMSolver (cosine, v_prediction, 5 steps)
+  - [x] Split LM autoregressive (base_lm + tts_lm, 4 KV-caches for CFG)
+  - [x] DPMSolver++ (cosine, v_prediction, configurable steps)
   - [x] Diffusion loop → Acoustic decode → WAV
-- [x] 1.5B Full (stub — export_onnx.py hidden_states fix 후 완성 가능)
-  - [x] Voice .wav → Acoustic encode
+  - [x] EOS classifier → speech end detection
+- [x] 1.5B Full
+  - [x] Voice .wav → Acoustic Encoder → latent → Acoustic Connector → voice embeddings
+  - [x] Prompt construction (system + voice + text + special tokens)
+  - [x] Unified LM prefill/decode with logits + hidden_states output
+  - [x] Token-constrained generation (speech_diffusion, speech_end, eos)
+  - [x] CFG: positive + negative path with KV-cache
+  - [x] DPM-Solver++ diffusion (20 steps, CFG scale=3.0)
+  - [x] Semantic feedback: decode → Semantic Encoder → Semantic Connector → next embedding
+  - [x] Batch acoustic decode → WAV
   - [ ] Multi-speaker script parsing
-  - [x] LM → Diffusion(10 steps) → Acoustic decode → WAV
 
 ### Phase 4: STT Pipeline (4-5일)
 - [x] Audio 전처리 (resample, normalize, mono)
@@ -585,12 +642,14 @@ build\release\vibevoice_server.exe --config config.json
 
 ## 8. Technical Challenges & Mitigations
 
-| Challenge | Mitigation |
+| Challenge | Mitigation / Resolution |
 |-----------|------------|
-| **KV-cache in TensorRT** | Prefill/Decode 별도 프로파일, external GPU buffer, dynamic shapes |
-| **Custom ops (RoPE, RMSNorm)** | ONNX 기본 연산으로 분해. Streaming cache는 C++에서 관리 |
-| **BPE 정확도** | tokenizer.json 직접 파싱, Python output 비교 테스트 |
-| **FP16 수치 차이** | Critical path FP32 유지, tolerance 검증 |
+| **KV-cache in TensorRT** | Prefill/Decode 별도 프로파일, external GPU buffer, dynamic shapes. FP16 KV-cache로 메모리 절감 (1.5B: 224MB/cache) |
+| **Custom ops (RoPE, RMSNorm)** | ONNX 기본 연산으로 분해. Connector/RMSNorm은 cuBLAS로 C++ 구현 |
+| **BPE 정확도** | tokenizer.json 직접 파싱, Python output 비교 테스트 완료 |
+| **FP16 수치 안정성** | 1.5B: ONNX를 FP16으로 export (embeds/hidden fp16, logits/mask fp32). 0.5B: FP32 엔진 사용 |
+| **TRT 비동기 실행 경합** | neg/pos decode 간 cudaStreamSynchronize 삽입, 공유 버퍼를 persistent member로 승격 |
+| **Semantic encoder 출력 레이아웃** | Channel-first [B,128,T] — stride 접근으로 프레임 추출 |
 | **ASR 7B 메모리 (~16GB)** | 모듈별 선택 로딩, INT8 양자화 옵션 |
 | **MSVC + nvcc 공존** | .cu는 nvcc로 컴파일 (MSVC를 host compiler로 사용) |
 
@@ -614,8 +673,8 @@ build\release\vibevoice_server.exe --config config.json
 
 ## 10. Voice Mapping
 
-**0.5B**: carter, davis, emma, frank, grace, mike, samuel (+ 다국어 18종)
-**1.5B**: alice, carter, frank, maya, mary, samuel, anchen, bowen, xinran
+**0.5B**: carter, davis, emma, frank, grace, mike, samuel (+ 다국어 18종) — `.bin` binary KV-cache preset
+**1.5B**: 9개 WAV 파일 (예: en-Carter_man, en-Maya_woman 등) — `.wav` 참조 음성
 
 **OpenAI aliases**: alloy→carter, echo→frank, fable→emma/alice, onyx→davis/carter, nova→grace/maya, shimmer→emma/alice
 

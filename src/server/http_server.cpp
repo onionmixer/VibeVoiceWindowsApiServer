@@ -213,10 +213,10 @@ std::string HttpServer::mapVoiceName(const std::string& name) const {
     static const std::unordered_map<std::string, std::string> voiceMap = {
         {"alloy",   "en-Carter_man"},
         {"echo",    "en-Frank_man"},
-        {"fable",   "en-Alice_woman"},
-        {"onyx",    "en-Bob_man"},
-        {"nova",    "en-Diana_woman"},
-        {"shimmer", "en-Emily_woman"},
+        {"fable",   "en-Davis_man"},
+        {"onyx",    "en-Mike_man"},
+        {"nova",    "en-Emma_woman"},
+        {"shimmer", "en-Grace_woman"},
     };
     auto it = voiceMap.find(name);
     if (it != voiceMap.end()) return it->second;
@@ -224,9 +224,9 @@ std::string HttpServer::mapVoiceName(const std::string& name) const {
 }
 
 std::string HttpServer::mapModelName(const std::string& name) const {
-    if (name == "tts-1" || name == "tts_0.5b" || name == "tts-1-1106") return "tts_0.5b";
-    if (name == "tts-1-hd" || name == "tts_1.5b" || name == "tts-1-hd-1106") return "tts_1.5b";
-    if (name == "whisper-1" || name == "asr") return "asr";
+    if (name == "tts-1" || name == "tts_0.5b" || name == "vibevoice-0.5b" || name == "tts-1-1106") return "tts_0.5b";
+    if (name == "tts-1-hd" || name == "tts_1.5b" || name == "vibevoice-1.5b" || name == "tts-1-hd-1106") return "tts_1.5b";
+    if (name == "whisper-1" || name == "asr" || name == "vibevoice-asr") return "asr";
     return name;
 }
 
