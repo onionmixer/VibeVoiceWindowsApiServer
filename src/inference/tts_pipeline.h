@@ -13,6 +13,7 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -60,9 +61,10 @@ private:
     Result synth15B(const Request& req);
 
     // Diffusion: returns latent [64] fp32 on CPU
+    // posCondGpu/negCondGpu: fp32 hidden states from LM (converted to fp16 internally for diffusion)
     std::vector<float> sampleSpeechTokens(
-        const __half* posCondGpu, const __half* negCondGpu,
-        int hiddenSize, float cfgScale);
+        const float* posCondF32Gpu, const float* negCondF32Gpu,
+        int hiddenSize, float cfgScale, std::mt19937& rng);
 
     // SpeechConnector: latent[64] -> embed[hidden_size] on GPU
     void runConnector(const __half* latentGpu, __half* outputGpu,
@@ -85,18 +87,18 @@ private:
                      const __half* inputGpu, __half* outputGpu,
                      int64_t positionId);
 
-    // 1.5B LM helpers: prefill and decode with logits output (FP16 ONNX engines)
+    // 1.5B LM helpers: prefill and decode with logits output (FP32 ONNX engines)
     // runLmPrefill: runs LM prefill with embedding sequence, fills KV cache
-    // embedsFp16Gpu: [1, S, H] fp16, logitsF32Gpu: [1, S, vocab] fp32, hiddenFp16Gpu: [1, S, H] fp16
+    // embedsF32Gpu: [1, S, H] fp32, logitsF32Gpu: [1, S, vocab] fp32, hiddenF32Gpu: [1, S, H] fp32
     void runLmPrefill(TRTEngine& engine, KVCache& kv,
-                      __half* embedsFp16Gpu, int seqLen,
-                      float* logitsF32Gpu, __half* hiddenFp16Gpu);
+                      float* embedsF32Gpu, int seqLen,
+                      float* logitsF32Gpu, float* hiddenF32Gpu);
 
     // runLmDecodeWithLogits: single-token decode returning logits + hidden (for 1.5B unified LM)
-    // All tensor I/O is fp16 except logits (fp32) and attention_mask (fp32)
-    // inputGpu: fp16 embedding, hiddenOutGpu: fp16 hidden state, logitsF32Gpu: fp32 logits [vocab]
+    // All tensor I/O is fp32 (embeds, hidden, logits, attention_mask, KV cache)
+    // inputGpu: fp32 embedding, hiddenOutGpu: fp32 hidden state, logitsF32Gpu: fp32 logits [vocab]
     void runLmDecodeWithLogits(TRTEngine& engine, KVCache& kv,
-                               const __half* inputGpu, __half* hiddenOutGpu,
+                               const float* inputGpu, float* hiddenOutGpu,
                                float* logitsF32Gpu, int64_t positionId);
 
     // Load all voice presets from directory
@@ -126,6 +128,28 @@ private:
 
     // Semantic encoder (1.5B only)
     TRTEngine semanticEncoder_;
+
+    // Streaming engines (1.5B — used in autoregressive loop for cache-based inference)
+    TRTEngine streamingSemEncoder_;    // streaming_semantic_encoder.trt
+    TRTEngine streamingAcDecoder_;     // streaming_acoustic_decoder.trt
+
+    // 0.5B streaming acoustic decoder (optional — falls back to batch decode if absent)
+    TRTEngine streaming05bAcDecoder_;  // engines/tts_0.5b/streaming_acoustic_decoder.trt
+    int acDec05bCacheSize_ = 0;        // cache size (e.g. 182080, same arch as 1.5B)
+    CudaBuffer acDec05bCacheGpu_;      // [cacheSize] fp32 — cache in
+    CudaBuffer acDec05bCacheOutGpu_;   // [cacheSize] fp32 — cache out
+    CudaBuffer loop05bSingleLatGpu_;   // [64] fp32 — per-frame latent
+    CudaBuffer loop05bSingleAudioGpu_; // [hop_length] fp32 — per-frame audio output
+
+    // Streaming cache sizes (from cache metadata JSON)
+    int semCacheSize_ = 0;             // e.g. 159622
+    int acDecCacheSize_ = 0;           // e.g. 182080
+
+    // Streaming cache GPU buffers (double-buffered: in ↔ out swap each iteration)
+    CudaBuffer semCacheGpu_;           // [semCacheSize_] fp32 — semantic encoder cache
+    CudaBuffer semCacheOutGpu_;        // [semCacheSize_] fp32 — semantic encoder cache output
+    CudaBuffer acDecCacheGpu_;         // [acDecCacheSize_] fp32 — acoustic decoder cache
+    CudaBuffer acDecCacheOutGpu_;      // [acDecCacheSize_] fp32 — acoustic decoder cache output
 
     // GPU weight buffers
     CudaBuffer embedTokensGpu_;                   // [vocab_size, hidden_size] fp16
@@ -168,9 +192,10 @@ private:
     cublasHandle_t cublas_ = nullptr;
 
     // Scratch buffers (fp16 — used for GPU-side operations: embedding, vectorAdd, connector, etc.)
-    CudaBuffer scratchEmbed_;      // [1, hidden_size] fp16
-    CudaBuffer scratchHidden_;     // [1, hidden_size] fp16
-    CudaBuffer scratchHidden2_;    // [1, hidden_size] fp16 (for neg path)
+    CudaBuffer scratchEmbed_;      // [1, hidden_size] fp16 (connector output, then converted to fp32 for LM)
+    CudaBuffer scratchHidden_;     // [1, hidden_size] fp32 (LM hidden output for pos path)
+    CudaBuffer scratchHidden2_;    // [1, hidden_size] fp32 (LM hidden output for neg path)
+    CudaBuffer scratchEmbedF32_;   // [1, hidden_size] fp32 (fp16 embed converted for LM input)
     CudaBuffer scratchLatent_;     // [64] fp16
     CudaBuffer scratchLatentF32_;  // [64] fp32
     CudaBuffer scratchAudio_;      // [1, 1, max_audio_len] fp16
@@ -206,4 +231,12 @@ private:
 
     // Persistent decode mask buffer (avoids freeing while TRT still reads async)
     CudaBuffer decodeMaskBuf_;
+
+    // 1.5B per-iteration reusable buffers (promoted from loop-local to avoid cudaMalloc/Free per step)
+    CudaBuffer loopSingleLatGpu_;    // [latent_dim] fp32 — denormalized latent for streaming acoustic decoder
+    CudaBuffer loopSingleAudioGpu_;  // [hop_length] fp32 — streaming acoustic decoder output / semantic encoder input
+    CudaBuffer loopSemOutGpu_;       // [semantic_vae_dim] fp32 — streaming semantic encoder output
+    CudaBuffer loopSemFrameGpu_;     // [semantic_vae_dim] fp32 — semantic frame staging for fp16 conversion
+    CudaBuffer loopSemLatFp16_;      // [semantic_vae_dim] fp16 — semantic frame in fp16 for connector
+    CudaBuffer loopNegLogitsF32_;    // [vocab_size] fp32 — negative path logits (discarded)
 };

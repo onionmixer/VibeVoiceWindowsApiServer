@@ -23,7 +23,7 @@
             "voices_dir": "voices/full_model",
             "tokenizer_path": "tokenizer/qwen2.5-1.5b/tokenizer.json",
             "special_tokens_path": "tokenizer/qwen2.5-1.5b/special_tokens.json",
-            "cfg_scale": 3.0,
+            "cfg_scale": 1.5,
             "inference_steps": 20
         },
         "asr": {

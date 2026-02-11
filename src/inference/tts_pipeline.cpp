@@ -5,9 +5,12 @@
 #include <cmath>
 #include <random>
 #include <filesystem>
+#include <fstream>
 #include <unordered_map>
+#include <json.hpp>
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 static std::string toLower(const std::string& s) {
     std::string result = s;
@@ -124,6 +127,23 @@ bool TTSPipeline::load(const Config& cfg) {
         if (!diffusionHead_.loadFromFile(dir + "diffusion_head.trt")) return false;
         if (!acousticDecoder_.loadFromFile(dir + "acoustic_decoder.trt")) return false;
         LOG_INFO("TTS", "loaded 6 TRT engines (0.5B)");
+
+        // Optional: streaming acoustic decoder (matches Python's per-frame decode with cache)
+        if (streaming05bAcDecoder_.loadFromFile(dir + "streaming_acoustic_decoder.trt")) {
+            std::string onnxDir = cfg.metadataPath.substr(0, cfg.metadataPath.find_last_of("/\\"));
+            auto loadCacheSize = [](const std::string& path, int defaultSize) -> int {
+                std::ifstream f(path);
+                if (!f.is_open()) return defaultSize;
+                json j = json::parse(f);
+                return j.value("total_cache_size", defaultSize);
+            };
+            acDec05bCacheSize_ = loadCacheSize(onnxDir + "/streaming_acoustic_decoder_cache.json", 182080);
+            acDec05bCacheGpu_.resize(acDec05bCacheSize_ * sizeof(float));
+            acDec05bCacheOutGpu_.resize(acDec05bCacheSize_ * sizeof(float));
+            LOG_INFO("TTS", "loaded streaming_acoustic_decoder for 0.5B (cache=%d)", acDec05bCacheSize_);
+        } else {
+            LOG_WARN("TTS", "streaming_acoustic_decoder not found for 0.5B, will use batch decode");
+        }
     } else {
         std::string dir = cfg.engineDir + "/";
         if (!lmPrefill_.loadFromFile(dir + "language_model_prefill.trt")) return false;
@@ -132,7 +152,32 @@ bool TTSPipeline::load(const Config& cfg) {
         if (!semanticEncoder_.loadFromFile(dir + "semantic_encoder.trt")) return false;
         if (!diffusionHead_.loadFromFile(dir + "diffusion_head.trt")) return false;
         if (!acousticDecoder_.loadFromFile(dir + "acoustic_decoder.trt")) return false;
-        LOG_INFO("TTS", "loaded 6 TRT engines (1.5B)");
+
+        // Load streaming engines for autoregressive cache-based inference
+        if (!streamingSemEncoder_.loadFromFile(dir + "streaming_semantic_encoder.trt")) return false;
+        if (!streamingAcDecoder_.loadFromFile(dir + "streaming_acoustic_decoder.trt")) return false;
+        LOG_INFO("TTS", "loaded 8 TRT engines (1.5B, including streaming)");
+
+        // Load streaming cache sizes from metadata JSONs
+        {
+            std::string onnxDir = cfg.metadataPath.substr(0, cfg.metadataPath.find_last_of("/\\"));
+            auto loadCacheSize = [](const std::string& path, int defaultSize) -> int {
+                std::ifstream f(path);
+                if (!f.is_open()) return defaultSize;
+                json j = json::parse(f);
+                return j.value("total_cache_size", defaultSize);
+            };
+            semCacheSize_ = loadCacheSize(onnxDir + "/streaming_semantic_encoder_cache.json", 159622);
+            acDecCacheSize_ = loadCacheSize(onnxDir + "/streaming_acoustic_decoder_cache.json", 182080);
+            LOG_INFO("TTS", "streaming cache sizes: semantic=%d, acoustic_decoder=%d",
+                     semCacheSize_, acDecCacheSize_);
+
+            // Allocate double-buffered cache GPU buffers
+            semCacheGpu_.resize(semCacheSize_ * sizeof(float));
+            semCacheOutGpu_.resize(semCacheSize_ * sizeof(float));
+            acDecCacheGpu_.resize(acDecCacheSize_ * sizeof(float));
+            acDecCacheOutGpu_.resize(acDecCacheSize_ * sizeof(float));
+        }
     }
 
     // Load weights
@@ -156,8 +201,10 @@ bool TTSPipeline::load(const Config& cfg) {
 
     // fp16 scratch buffers for GPU-side operations (embedding, vectorAdd, etc.)
     scratchEmbed_.resize(H * sizeof(uint16_t));
-    scratchHidden_.resize(H * sizeof(uint16_t));
-    scratchHidden2_.resize(H * sizeof(uint16_t));
+    // fp32 scratch for LM hidden states (1.5B FP32 engines)
+    scratchHidden_.resize(H * sizeof(float));
+    scratchHidden2_.resize(H * sizeof(float));
+    scratchEmbedF32_.resize(H * sizeof(float));
     scratchLatent_.resize(latentDim * sizeof(uint16_t));
     scratchLatentF32_.resize(latentDim * sizeof(float));
     scratchAudio_.resize(1 * 1 * 32000 * sizeof(uint16_t));
@@ -184,6 +231,12 @@ bool TTSPipeline::load(const Config& cfg) {
         scratchEosSigmoid_.resize(sizeof(float));
     }
 
+    // 0.5B streaming acoustic decoder loop buffers
+    if (type_ == ModelType::STREAMING_0_5B && streaming05bAcDecoder_.isLoaded()) {
+        loop05bSingleLatGpu_.resize(latentDim * sizeof(float));
+        loop05bSingleAudioGpu_.resize(hopLen * sizeof(float));
+    }
+
     // 1.5B-specific scratch buffers
     if (type_ == ModelType::FULL_1_5B) {
         int vocabSize = meta_.vocab_size;
@@ -197,6 +250,14 @@ bool TTSPipeline::load(const Config& cfg) {
         scratchSemanticLatent_.resize(semDim * sizeof(uint16_t));
         scratchSemanticEmbed_.resize(H * sizeof(uint16_t));
         scratchVoiceEmbedF32_.resize((size_t)256 * H * sizeof(float)); // max 256 voice tokens
+
+        // Per-iteration reusable buffers (avoid cudaMalloc/Free per step in autoregressive loop)
+        loopSingleLatGpu_.resize(latentDim * sizeof(float));
+        loopSingleAudioGpu_.resize(hopLen * sizeof(float));
+        loopSemOutGpu_.resize(semDim * sizeof(float));
+        loopSemFrameGpu_.resize(semDim * sizeof(float));
+        loopSemLatFp16_.resize(semDim * sizeof(uint16_t));
+        loopNegLogitsF32_.resize(vocabSize * sizeof(float));
         LOG_INFO("TTS", "allocated 1.5B scratch: vocab=%d, semDim=%d", vocabSize, semDim);
     }
 
@@ -417,8 +478,8 @@ void TTSPipeline::runLmDecode(TRTEngine& engine, KVCache& kv,
 // ── 1.5B LM Prefill helper (FP16 ONNX engine) ──
 
 void TTSPipeline::runLmPrefill(TRTEngine& engine, KVCache& kv,
-                                __half* embedsFp16Gpu, int seqLen,
-                                float* logitsF32Gpu, __half* hiddenFp16Gpu) {
+                                float* embedsF32Gpu, int seqLen,
+                                float* logitsF32Gpu, float* hiddenF32Gpu) {
     int H = meta_.hidden_size;
 
     // Build position_ids [1, seqLen]: 0, 1, 2, ..., seqLen-1
@@ -441,16 +502,16 @@ void TTSPipeline::runLmPrefill(TRTEngine& engine, KVCache& kv,
     causalMaskGpu.resize((size_t)seqLen * seqLen * sizeof(float));
     causalMaskGpu.copyFromHost(causalMask.data(), (size_t)seqLen * seqLen * sizeof(float));
 
-    // Set shapes and bind — FP16 ONNX: embeds and hidden are fp16, logits and mask are fp32
+    // Set shapes and bind — FP32 ONNX: all I/O is fp32
     engine.setInputShape("inputs_embeds", nvinfer1::Dims3{1, seqLen, H});
     engine.setInputShape("position_ids", nvinfer1::Dims2{1, seqLen});
     nvinfer1::Dims4 maskShape{1, 1, seqLen, seqLen};
     engine.setInputShape("attention_mask", maskShape);
-    engine.setTensorAddress("inputs_embeds", (void*)embedsFp16Gpu);  // fp16
+    engine.setTensorAddress("inputs_embeds", (void*)embedsF32Gpu);   // fp32
     engine.setTensorAddress("position_ids", posIdsBuf.data());
     engine.setTensorAddress("attention_mask", causalMaskGpu.data());  // fp32
     engine.setTensorAddress("logits", logitsF32Gpu);                  // fp32
-    engine.setTensorAddress("hidden_states", (void*)hiddenFp16Gpu);  // fp16
+    engine.setTensorAddress("hidden_states", (void*)hiddenF32Gpu);   // fp32
 
     // Bind KV cache (prefill mode: only present outputs, no past inputs)
     bindKVCache(engine, kv, /*prefillMode=*/true);
@@ -461,10 +522,10 @@ void TTSPipeline::runLmPrefill(TRTEngine& engine, KVCache& kv,
     kv.advanceAfterPrefill(seqLen);
 }
 
-// ── 1.5B LM Decode with logits helper (FP16 ONNX engine) ──
+// ── 1.5B LM Decode with logits helper (FP32 ONNX engine) ──
 
 void TTSPipeline::runLmDecodeWithLogits(TRTEngine& engine, KVCache& kv,
-                                          const __half* inputGpu, __half* hiddenOutGpu,
+                                          const float* inputGpu, float* hiddenOutGpu,
                                           float* logitsF32Gpu, int64_t positionId) {
     int H = meta_.hidden_size;
 
@@ -479,16 +540,16 @@ void TTSPipeline::runLmDecodeWithLogits(TRTEngine& engine, KVCache& kv,
     decodeMaskBuf_.resize(maskBytes);
     cudaMemsetAsync(decodeMaskBuf_.data(), 0, maskBytes, stream_);
 
-    // Configure engine — FP16 ONNX: embeds and hidden are fp16, logits and mask are fp32
+    // Configure engine — FP32 ONNX: all I/O is fp32
     engine.setInputShape("inputs_embeds", nvinfer1::Dims3{1, 1, H});
     engine.setInputShape("position_ids", nvinfer1::Dims2{1, 1});
     nvinfer1::Dims4 maskShape{1, 1, 1, totalSeq};
     engine.setInputShape("attention_mask", maskShape);
-    engine.setTensorAddress("inputs_embeds", (void*)inputGpu);  // fp16 direct
+    engine.setTensorAddress("inputs_embeds", (void*)inputGpu);     // fp32
     engine.setTensorAddress("position_ids", positionIdsBuf_.data());
     engine.setTensorAddress("attention_mask", decodeMaskBuf_.data());
-    engine.setTensorAddress("logits", logitsF32Gpu);             // fp32
-    engine.setTensorAddress("hidden_states", (void*)hiddenOutGpu); // fp16 direct
+    engine.setTensorAddress("logits", logitsF32Gpu);                // fp32
+    engine.setTensorAddress("hidden_states", (void*)hiddenOutGpu); // fp32
     bindKVCache(engine, kv);
     engine.enqueueV3(stream_);
     kv.advance();
@@ -573,13 +634,32 @@ TTSPipeline::Result TTSPipeline::synth05B(const Request& req) {
     // Collect all denormalized latents for batch decoding at the end
     std::vector<float> allDenormLatents;  // [N * 64] stored as [t0_d0..t0_d63, t1_d0..t1_d63, ...]
 
+    // Initialize RNG once per synthesis
+    std::random_device rd05;
+    std::mt19937 synthRng05(rd05());
+
     bool finished = false;
     int textOffset = 0;
     int textWindowSize = 5;
     int speechWindowSize = 6;
     int totalSpeechTokens = 0;
 
-    while (!finished && (textOffset < (int)textIds.size() || !finished)) {
+    // Text-aware max speech token limit (matching 1.5B safety net)
+    int hopLen05 = meta_.hop_length > 0 ? meta_.hop_length : 3200;
+    int absMax = (meta_.sample_rate * 30) / hopLen05;  // 30s absolute max
+    int textBasedMax = std::max(45, (int)textIds.size() * 4);
+    int maxSpeechTokens = std::min(absMax, textBasedMax);
+    LOG_INFO("TTS", "0.5B maxSpeechTokens: min(absMax=%d, textBased=%d [textTokens=%d]) = %d",
+             absMax, textBasedMax, (int)textIds.size(), maxSpeechTokens);
+
+    // Initialize streaming acoustic decoder cache (zero at request start)
+    if (streaming05bAcDecoder_.isLoaded()) {
+        cudaMemsetAsync(acDec05bCacheGpu_.data(), 0, acDec05bCacheSize_ * sizeof(float), stream_);
+        cudaMemsetAsync(acDec05bCacheOutGpu_.data(), 0, acDec05bCacheSize_ * sizeof(float), stream_);
+    }
+
+    while (!finished && totalSpeechTokens < maxSpeechTokens &&
+           (textOffset < (int)textIds.size() || !finished)) {
         // === Text Window ===
         int windowEnd = std::min(textOffset + textWindowSize, (int)textIds.size());
         for (int ti = textOffset; ti < windowEnd; ++ti) {
@@ -631,9 +711,12 @@ TTSPipeline::Result TTSPipeline::synth05B(const Request& req) {
                 diagLogFp16("diffusion_cond_pos", scratchHidden_.as<__half>(), H, stream_);
                 diagLogFp16("diffusion_cond_neg", scratchHidden2_.as<__half>(), H, stream_);
             }
+            // 0.5B path: convert FP16 hidden to FP32 for sampleSpeechTokens
+            GpuOps::halfToFloat(scratchHidden_.as<__half>(), stagingEmbedsF32_.as<float>(), H, stream_);
+            GpuOps::halfToFloat(scratchHidden2_.as<__half>(), stagingHiddenF32_.as<float>(), H, stream_);
             std::vector<float> latent = sampleSpeechTokens(
-                scratchHidden_.as<__half>(), scratchHidden2_.as<__half>(),
-                H, cfg_.cfgScale);
+                stagingEmbedsF32_.as<float>(), stagingHiddenF32_.as<float>(),
+                H, cfg_.cfgScale, synthRng05);
 
             if (si == 0) {
                 float lMin = *std::min_element(latent.begin(), latent.end());
@@ -683,24 +766,55 @@ TTSPipeline::Result TTSPipeline::synth05B(const Request& req) {
         }
 
         // If all text has been processed and we haven't gotten EOS,
-        // continue generating speech tokens until EOS or max length
+        // continue generating speech tokens until EOS or maxSpeechTokens
         if (textOffset >= (int)textIds.size() && !finished) {
-            int maxSamples = meta_.sample_rate * 30;
-            int hopLen = meta_.hop_length;
-            if (totalSpeechTokens * hopLen > maxSamples) {
-                finished = true;
-            }
+            // maxSpeechTokens check is in the while condition
         }
     }
 
-    // === Batch Acoustic Decoding ===
-    // Decode all latents at once: [1, 64, N] -> [1, 1, N * hop_length]
-    // This allows convolutional layers to see the full temporal context.
+    // === Acoustic Decoding ===
     int N = totalSpeechTokens;
     int hopLen = meta_.hop_length;
-    LOG_INFO("TTS", "batch decoding %d latent frames -> %d audio samples", N, N * hopLen);
 
-    if (N > 0) {
+    if (N > 0 && streaming05bAcDecoder_.isLoaded()) {
+        // === Streaming Acoustic Decoding (matches Python reference) ===
+        // Decode per-frame: [1, 64, 1] + cache -> [1, 1, hop_length] + cache
+        LOG_INFO("TTS", "streaming decoding %d latent frames -> %d audio samples", N, N * hopLen);
+
+        result.audio.reserve(N * hopLen);
+        for (int t = 0; t < N; ++t) {
+            // Upload denormalized latent for this frame
+            loop05bSingleLatGpu_.copyFromHost(
+                allDenormLatents.data() + t * latentDim, latentDim * sizeof(float));
+
+            streaming05bAcDecoder_.setInputShape("latent", nvinfer1::Dims3{1, latentDim, 1});
+            nvinfer1::Dims2 cacheDims{1, acDec05bCacheSize_};
+            streaming05bAcDecoder_.setInputShape("cache_in", cacheDims);
+            streaming05bAcDecoder_.setTensorAddress("latent", loop05bSingleLatGpu_.data());
+            streaming05bAcDecoder_.setTensorAddress("cache_in", acDec05bCacheGpu_.data());
+            streaming05bAcDecoder_.setTensorAddress("audio", loop05bSingleAudioGpu_.data());
+            streaming05bAcDecoder_.setTensorAddress("cache_out", acDec05bCacheOutGpu_.data());
+            streaming05bAcDecoder_.enqueueV3(stream_);
+
+            // Swap cache buffers (double-buffering)
+            std::swap(acDec05bCacheGpu_, acDec05bCacheOutGpu_);
+
+            // Copy audio chunk to result
+            std::vector<float> chunk(hopLen);
+            cudaStreamSynchronize(stream_);
+            loop05bSingleAudioGpu_.copyToHost(chunk.data(), hopLen * sizeof(float));
+            result.audio.insert(result.audio.end(), chunk.begin(), chunk.end());
+        }
+
+        float aMin = *std::min_element(result.audio.begin(), result.audio.end());
+        float aMax = *std::max_element(result.audio.begin(), result.audio.end());
+        LOG_INFO("TTS", "streaming decoded audio [%d samples]: min=%.4f max=%.4f",
+                 (int)result.audio.size(), aMin, aMax);
+    } else if (N > 0) {
+        // === Fallback: Batch Acoustic Decoding ===
+        // Decode all latents at once: [1, 64, N] -> [1, 1, N * hop_length]
+        LOG_INFO("TTS", "batch decoding %d latent frames -> %d audio samples", N, N * hopLen);
+
         // Transpose from [N, 64] (row-major) to [64, N] for decoder input [1, 64, N]
         std::vector<float> batchLatent(64 * N);
         for (int t = 0; t < N; ++t) {
@@ -709,22 +823,18 @@ TTSPipeline::Result TTSPipeline::synth05B(const Request& req) {
             }
         }
 
-        // Upload to GPU
         CudaBuffer batchLatentGpu;
         batchLatentGpu.resize(64 * N * sizeof(float));
         batchLatentGpu.copyFromHostAsync(batchLatent.data(), 64 * N * sizeof(float), stream_);
 
-        // Allocate output buffer
         CudaBuffer batchAudioGpu;
         batchAudioGpu.resize(1 * 1 * N * hopLen * sizeof(float));
 
-        // Run acoustic decoder with batch shape
         acousticDecoder_.setInputShape("latent", nvinfer1::Dims3{1, 64, N});
         acousticDecoder_.setTensorAddress("latent", batchLatentGpu.data());
         acousticDecoder_.setTensorAddress("audio", batchAudioGpu.data());
         acousticDecoder_.enqueueV3(stream_);
 
-        // Download all audio
         result.audio.resize(N * hopLen);
         cudaStreamSynchronize(stream_);
         batchAudioGpu.copyToHost(result.audio.data(), N * hopLen * sizeof(float));
@@ -992,36 +1102,31 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
     std::vector<float> negPromptEmbeds(1 * H);
     getTokenEmbed(specialTokens_.speech_start, negPromptEmbeds.data());
 
-    // ── 8. Init KV caches (pos + neg) — FP16 for 1.5B FP16 ONNX engines ──
+    // ── 8. Init KV caches (pos + neg) — FP32 for 1.5B FP32 ONNX engines ──
     int maxSeqLen = 4096;
-    if (!lmKV_.init(numLmLayers, numKvHeads, headDim, maxSeqLen, /*useFp16=*/true)) {
+    if (!lmKV_.init(numLmLayers, numKvHeads, headDim, maxSeqLen, /*useFp16=*/false)) {
         result.error = "Failed to init positive LM KV cache";
         return result;
     }
-    if (!negLmKV_.init(numLmLayers, numKvHeads, headDim, maxSeqLen, /*useFp16=*/true)) {
+    if (!negLmKV_.init(numLmLayers, numKvHeads, headDim, maxSeqLen, /*useFp16=*/false)) {
         result.error = "Failed to init negative LM KV cache";
         return result;
     }
 
-    // ── 9. Prefill positive path (FP16 embeds, FP16 hidden, FP32 logits) ──
-    // Upload fp32 embeddings to GPU, then convert to fp16
+    // ── 9. Prefill positive path (FP32 embeds, FP32 hidden, FP32 logits) ──
+    // Upload fp32 embeddings directly to GPU (no fp16 conversion needed)
     CudaBuffer prefillEmbedsF32Gpu;
     prefillEmbedsF32Gpu.resize((size_t)promptLen * H * sizeof(float));
     prefillEmbedsF32Gpu.copyFromHost(promptEmbeds.data(), (size_t)promptLen * H * sizeof(float));
-    CudaBuffer prefillEmbedsFp16Gpu;
-    prefillEmbedsFp16Gpu.resize((size_t)promptLen * H * sizeof(uint16_t));
-    GpuOps::floatToHalf(prefillEmbedsF32Gpu.as<float>(), prefillEmbedsFp16Gpu.as<__half>(),
-                         promptLen * H, stream_);
-    prefillEmbedsF32Gpu.free();
 
     CudaBuffer prefillLogitsGpu;
     prefillLogitsGpu.resize((size_t)promptLen * vocabSize * sizeof(float));
-    CudaBuffer prefillHiddenFp16Gpu;
-    prefillHiddenFp16Gpu.resize((size_t)promptLen * H * sizeof(uint16_t));
+    CudaBuffer prefillHiddenF32Gpu;
+    prefillHiddenF32Gpu.resize((size_t)promptLen * H * sizeof(float));
 
     runLmPrefill(lmPrefill_, lmKV_,
-                 prefillEmbedsFp16Gpu.as<__half>(), promptLen,
-                 prefillLogitsGpu.as<float>(), prefillHiddenFp16Gpu.as<__half>());
+                 prefillEmbedsF32Gpu.as<float>(), promptLen,
+                 prefillLogitsGpu.as<float>(), prefillHiddenF32Gpu.as<float>());
     cudaStreamSynchronize(stream_);
     LOG_INFO("TTS", "positive prefill done (seq=%d)", promptLen);
 
@@ -1031,32 +1136,28 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                (float*)prefillLogitsGpu.data() + (size_t)(promptLen - 1) * vocabSize,
                vocabSize * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Extract last-position hidden (fp16) directly to scratchHidden_ on GPU
+    // Extract last-position hidden (fp32) directly to scratchHidden_ on GPU
     cudaMemcpy(scratchHidden_.data(),
-               (uint8_t*)prefillHiddenFp16Gpu.data() + (size_t)(promptLen - 1) * H * sizeof(uint16_t),
-               H * sizeof(uint16_t), cudaMemcpyDeviceToDevice);
+               (float*)prefillHiddenF32Gpu.data() + (size_t)(promptLen - 1) * H,
+               H * sizeof(float), cudaMemcpyDeviceToDevice);
 
-    prefillEmbedsFp16Gpu.free();
+    prefillEmbedsF32Gpu.free();
     prefillLogitsGpu.free();
-    prefillHiddenFp16Gpu.free();
+    prefillHiddenF32Gpu.free();
 
-    // ── 10. Prefill negative path (FP16 embeds, FP16 hidden, FP32 logits) ──
+    // ── 10. Prefill negative path (FP32 embeds, FP32 hidden, FP32 logits) ──
     CudaBuffer negEmbedsF32Gpu;
     negEmbedsF32Gpu.resize(1 * H * sizeof(float));
     negEmbedsF32Gpu.copyFromHost(negPromptEmbeds.data(), 1 * H * sizeof(float));
-    CudaBuffer negEmbedsFp16Gpu;
-    negEmbedsFp16Gpu.resize(1 * H * sizeof(uint16_t));
-    GpuOps::floatToHalf(negEmbedsF32Gpu.as<float>(), negEmbedsFp16Gpu.as<__half>(), H, stream_);
-    negEmbedsF32Gpu.free();
 
     CudaBuffer negPrefillLogitsGpu;
     negPrefillLogitsGpu.resize(1 * vocabSize * sizeof(float));
-    CudaBuffer negPrefillHiddenFp16Gpu;
-    negPrefillHiddenFp16Gpu.resize(1 * H * sizeof(uint16_t));
+    CudaBuffer negPrefillHiddenF32Gpu;
+    negPrefillHiddenF32Gpu.resize(1 * H * sizeof(float));
 
     runLmPrefill(lmPrefill_, negLmKV_,
-                 negEmbedsFp16Gpu.as<__half>(), 1,
-                 negPrefillLogitsGpu.as<float>(), negPrefillHiddenFp16Gpu.as<__half>());
+                 negEmbedsF32Gpu.as<float>(), 1,
+                 negPrefillLogitsGpu.as<float>(), negPrefillHiddenF32Gpu.as<float>());
     cudaStreamSynchronize(stream_);
     LOG_INFO("TTS", "negative prefill done (seq=1)");
 
@@ -1064,25 +1165,46 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
     int64_t posPos = (int64_t)promptLen;
     int64_t negPos = 1;
 
-    std::vector<float> allDenormLatents; // collected for batch decode
+    std::vector<float> allDenormLatents; // collected (kept for diagnostics)
+    std::vector<std::vector<float>> audioChunks; // streaming decoded audio chunks
     int totalSpeechTokens = 0;
-    int maxSpeechTokens = (meta_.sample_rate * 30) / hopLen; // 30 seconds max
+
+    // Initialize RNG once per synthesis (matches Python's global torch RNG behavior)
+    std::random_device rd;
+    std::mt19937 synthRng(rd());
+
+    // Initialize streaming caches to zero (equivalent to Python's zero-initialized cache)
+    // Zero both in and out buffers to prevent stale data from previous requests
+    cudaMemsetAsync(semCacheGpu_.data(), 0, semCacheSize_ * sizeof(float), stream_);
+    cudaMemsetAsync(semCacheOutGpu_.data(), 0, semCacheSize_ * sizeof(float), stream_);
+    cudaMemsetAsync(acDecCacheGpu_.data(), 0, acDecCacheSize_ * sizeof(float), stream_);
+    cudaMemsetAsync(acDecCacheOutGpu_.data(), 0, acDecCacheSize_ * sizeof(float), stream_);
+    // Max speech tokens: text-aware safety limit
+    // On GTX 1660 (Python/BF16), LM runs in effective FP32 -> stable logit convergence
+    // On RTX 3080 (C++/TRT FP16), logit convergence is less reliable
+    // Safety net: cap max speech tokens based on text length to prevent extreme over-generation
+    // Empirical ratio: ~2.5 speech tokens per text token (0.33s audio per text token)
+    // Use 4x safety factor -> ~10 speech tokens per text token
+    int absMax = (meta_.sample_rate * 30) / hopLen; // 30 seconds absolute max
+    int textTokenCount = (int)textLineTokens.size();
+    int textBasedMax = std::max(45, textTokenCount * 4); // min 6 seconds, 4x estimated duration
+    int maxSpeechTokens = std::min(absMax, textBasedMax);
+    LOG_INFO("TTS", "maxSpeechTokens: min(absMax=%d, textBased=%d [textTokens=%d]) = %d",
+             absMax, textBasedMax, textTokenCount, maxSpeechTokens);
     bool finished = false;
 
     // Positive hidden is already in scratchHidden_ (extracted from prefill above)
 
-    // Extract negative hidden (fp16) directly to scratchHidden2_ on GPU
-    cudaMemcpy(scratchHidden2_.data(), negPrefillHiddenFp16Gpu.data(),
-               H * sizeof(uint16_t), cudaMemcpyDeviceToDevice);
+    // Extract negative hidden (fp32) directly to scratchHidden2_ on GPU
+    cudaMemcpy(scratchHidden2_.data(), negPrefillHiddenF32Gpu.data(),
+               H * sizeof(float), cudaMemcpyDeviceToDevice);
 
     // Free negative prefill buffers
-    negEmbedsFp16Gpu.free();
+    negEmbedsF32Gpu.free();
     negPrefillLogitsGpu.free();
-    negPrefillHiddenFp16Gpu.free();
+    negPrefillHiddenF32Gpu.free();
 
-    // Allocate separate logits buffer for negative path (we discard neg logits)
-    CudaBuffer negLogitsF32;
-    negLogitsF32.resize(vocabSize * sizeof(float));
+    // Use persistent negative logits buffer (class member, avoids per-request alloc/free)
 
     LOG_INFO("TTS", "starting autoregressive generation (maxTokens=%d)", maxSpeechTokens);
 
@@ -1150,22 +1272,23 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
         if (nextToken == specialTokens_.speech_start) {
             // Feed speech_start embedding to both LM paths
             LOG_INFO("TTS", "speech_start at step %d", totalSpeechTokens);
-            // Get embedding fp16 directly on GPU via embeddingLookup
+            // Get embedding fp16 on GPU, then convert to fp32 for LM
             int32_t tokId = specialTokens_.speech_start;
             inputIdBuf_.copyFromHost(&tokId, sizeof(int32_t));
             GpuOps::embeddingLookup(embedTokensGpu_.as<__half>(),
                                     inputIdBuf_.as<int32_t>(), scratchEmbed_.as<__half>(),
                                     1, H, stream_);
+            GpuOps::halfToFloat(scratchEmbed_.as<__half>(), scratchEmbedF32_.as<float>(), H, stream_);
 
             runLmDecodeWithLogits(lmDecode_, negLmKV_,
-                                  scratchEmbed_.as<__half>(), scratchHidden2_.as<__half>(),
-                                  negLogitsF32.as<float>(), negPos);
+                                  scratchEmbedF32_.as<float>(), scratchHidden2_.as<float>(),
+                                  loopNegLogitsF32_.as<float>(), negPos);
             negPos++;
             // Sync: ensure negative decode completes before reusing shared
             // TRT context, positionIdsBuf_, and decodeMaskBuf_
             cudaStreamSynchronize(stream_);
             runLmDecodeWithLogits(lmDecode_, lmKV_,
-                                  scratchEmbed_.as<__half>(), scratchHidden_.as<__half>(),
+                                  scratchEmbedF32_.as<float>(), scratchHidden_.as<float>(),
                                   stagingLogitsF32_.as<float>(), posPos);
             posPos++;
 
@@ -1175,10 +1298,10 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
         }
 
         if (nextToken == specialTokens_.speech_diffusion) {
-            // c. Diffusion sampling using positive and negative hidden states
+            // c. Diffusion sampling using positive and negative hidden states (FP32)
             std::vector<float> latent = sampleSpeechTokens(
-                scratchHidden_.as<__half>(), scratchHidden2_.as<__half>(),
-                H, cfg_.cfgScale);
+                scratchHidden_.as<float>(), scratchHidden2_.as<float>(),
+                H, cfg_.cfgScale, synthRng);
 
             // d. Denormalize for acoustic decoder: latent / scaling - bias
             std::vector<float> denormLatent(latentDim);
@@ -1199,81 +1322,74 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                          connInputDim_, connOutputDim_);
             // scratchEmbed_ now has acoustic embedding [H] fp16
 
-            // e2. Single-frame decode for semantic feedback
-            // (Python reference decodes frame-by-frame with streaming cache)
-            CudaBuffer singleLatGpu;
-            singleLatGpu.resize(latentDim * sizeof(float));
-            singleLatGpu.copyFromHost(denormLatent.data(), latentDim * sizeof(float));
+            // e2. Streaming acoustic decode: latent [1,64,1] + cache → audio [1,1,3200] + cache
+            // (matches Python's streaming decoder with per-layer SConv1d/SConvTranspose1d cache)
+            loopSingleLatGpu_.copyFromHost(denormLatent.data(), latentDim * sizeof(float));
 
-            int singleAudioLen = hopLen; // 3200 samples for 1 frame
-            CudaBuffer singleAudioGpu;
-            singleAudioGpu.resize(singleAudioLen * sizeof(float));
+            streamingAcDecoder_.setInputShape("latent", nvinfer1::Dims3{1, latentDim, 1});
+            nvinfer1::Dims2 acCacheDims{1, acDecCacheSize_};
+            streamingAcDecoder_.setInputShape("cache_in", acCacheDims);
+            streamingAcDecoder_.setTensorAddress("latent", loopSingleLatGpu_.data());
+            streamingAcDecoder_.setTensorAddress("cache_in", acDecCacheGpu_.data());
+            streamingAcDecoder_.setTensorAddress("audio", loopSingleAudioGpu_.data());
+            streamingAcDecoder_.setTensorAddress("cache_out", acDecCacheOutGpu_.data());
+            streamingAcDecoder_.enqueueV3(stream_);
 
-            acousticDecoder_.setInputShape("latent", nvinfer1::Dims3{1, latentDim, 1});
-            acousticDecoder_.setTensorAddress("latent", singleLatGpu.data());
-            acousticDecoder_.setTensorAddress("audio", singleAudioGpu.data());
-            acousticDecoder_.enqueueV3(stream_);
+            // Swap cache buffers for next iteration (double-buffering)
+            std::swap(acDecCacheGpu_, acDecCacheOutGpu_);
 
-            // e3. Run semantic encoder on decoded audio (padded to TRT minimum)
-            int semAudioLen = 24000; // TRT min input size
-            int semTMax = semAudioLen / hopLen + 2;
+            // Save audio chunk for final output (streaming decode produces final audio directly)
+            {
+                std::vector<float> audioChunk(hopLen);
+                cudaStreamSynchronize(stream_);
+                loopSingleAudioGpu_.copyToHost(audioChunk.data(), hopLen * sizeof(float));
+                audioChunks.push_back(std::move(audioChunk));
+            }
 
-            CudaBuffer semAudioPadGpu;
-            semAudioPadGpu.resize((size_t)semAudioLen * sizeof(float));
-            cudaMemsetAsync(semAudioPadGpu.data(), 0, semAudioLen * sizeof(float), stream_);
-            cudaMemcpyAsync(semAudioPadGpu.data(), singleAudioGpu.data(),
-                            (size_t)singleAudioLen * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
+            // e3. Streaming semantic encode: audio [1,1,3200] + cache → features [1,1,128] + cache
+            // (matches Python's streaming encoder with per-layer SConv1d cache)
+            streamingSemEncoder_.setInputShape("audio", nvinfer1::Dims3{1, 1, hopLen});
+            nvinfer1::Dims2 semCacheDims{1, semCacheSize_};
+            streamingSemEncoder_.setInputShape("cache_in", semCacheDims);
+            streamingSemEncoder_.setTensorAddress("audio", loopSingleAudioGpu_.data());
+            streamingSemEncoder_.setTensorAddress("cache_in", semCacheGpu_.data());
+            streamingSemEncoder_.setTensorAddress("semantic_mean", loopSemOutGpu_.data());
+            streamingSemEncoder_.setTensorAddress("cache_out", semCacheOutGpu_.data());
+            streamingSemEncoder_.enqueueV3(stream_);
 
-            CudaBuffer semOutGpu;
-            semOutGpu.resize((size_t)semDim * semTMax * sizeof(float));
-            cudaMemsetAsync(semOutGpu.data(), 0, (size_t)semDim * semTMax * sizeof(float), stream_);
+            // Swap cache buffers for next iteration
+            std::swap(semCacheGpu_, semCacheOutGpu_);
 
-            semanticEncoder_.setInputShape("audio", nvinfer1::Dims3{1, 1, semAudioLen});
-            semanticEncoder_.setTensorAddress("audio", semAudioPadGpu.data());
-            semanticEncoder_.setTensorAddress("semantic_mean", semOutGpu.data());
-            semanticEncoder_.enqueueV3(stream_);
-
-            // e4. semantic_connector: take first real frame [semDim] -> [H]
-            // Output is [1, vae_dim, T] (channel-first); use frame 0 (covers real audio)
-            auto semOutShape = semanticEncoder_.getOutputShape("semantic_mean");
-            int actualSemFrames = (semOutShape.nbDims >= 3) ? (int)semOutShape.d[2] : 1;
-            int semFrameIdx = 0; // first frame covers real audio (rest is zero-padded)
             if (dbgLog) {
-                fprintf(dbgLog, "  sem_encoder: audio=%d -> shape[%d]={",
-                        semAudioLen, semOutShape.nbDims);
+                auto semOutShape = streamingSemEncoder_.getOutputShape("semantic_mean");
+                fprintf(dbgLog, "  streaming_sem_encoder: audio=%d -> shape[%d]={",
+                        hopLen, semOutShape.nbDims);
                 for (int di = 0; di < semOutShape.nbDims; ++di)
                     fprintf(dbgLog, "%s%d", di > 0 ? "," : "", (int)semOutShape.d[di]);
-                fprintf(dbgLog, "} T=%d (frame=%d)\n", actualSemFrames, semFrameIdx);
+                fprintf(dbgLog, "}\n");
                 fflush(dbgLog);
             }
 
-            // Extract frame from [1, semDim, T] layout (channel-first)
-            int T_sem = actualSemFrames;
-            std::vector<float> semFrameF32(semDim);
-            {
-                std::vector<float> semAllCpu(semDim * T_sem);
-                cudaStreamSynchronize(stream_);
-                semOutGpu.copyToHost(semAllCpu.data(), semDim * T_sem * sizeof(float));
-                for (int c = 0; c < semDim; ++c) {
-                    semFrameF32[c] = semAllCpu[c * T_sem + semFrameIdx];
-                }
-            }
+            // e4. semantic_connector: features [1,1,semDim] -> [H]
+            // Output from streaming encoder is [1, 1, semDim] (batch, time=1, features)
+            // Copy semantic output to staging buffer and convert to fp16 for connector
+            cudaStreamSynchronize(stream_);
+            cudaMemcpyAsync(loopSemFrameGpu_.data(), loopSemOutGpu_.data(),
+                            semDim * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
+            GpuOps::floatToHalf(loopSemFrameGpu_.as<float>(), loopSemLatFp16_.as<__half>(), semDim, stream_);
 
-            CudaBuffer semLatFp16;
-            semLatFp16.resize(semDim * sizeof(uint16_t));
-            CudaBuffer semFrameGpu;
-            semFrameGpu.resize(semDim * sizeof(float));
-            semFrameGpu.copyFromHost(semFrameF32.data(), semDim * sizeof(float));
-            GpuOps::floatToHalf(semFrameGpu.as<float>(), semLatFp16.as<__half>(), semDim, stream_);
-
-            runConnector(semLatFp16.as<__half>(), scratchSemanticEmbed_.as<__half>(),
+            runConnector(loopSemLatFp16_.as<__half>(), scratchSemanticEmbed_.as<__half>(),
                          semanticConnFc1W_, semanticConnFc1B_, semanticConnNormW_,
                          semanticConnFc2W_, semanticConnFc2B_,
                          semConnInputDim_, semConnOutputDim_);
 
             // e5. next_embed = acoustic_embed + semantic_embed
+            // No blending needed — streaming cache ensures smooth temporal continuity
             GpuOps::vectorAdd(scratchEmbed_.as<__half>(), scratchSemanticEmbed_.as<__half>(),
                               scratchEmbed_.as<__half>(), H, stream_);
+
+            // e6. Convert combined fp16 embedding to fp32 for LM input
+            GpuOps::halfToFloat(scratchEmbed_.as<__half>(), scratchEmbedF32_.as<float>(), H, stream_);
 
             // Diagnostic: log intermediate values
             if (dbgLog) {
@@ -1285,11 +1401,10 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                 for (int i = 0; i < latentDim; ++i) dlNorm += denormLatent[i] * denormLatent[i];
                 dlNorm = sqrtf(dlNorm);
 
-                // Check combined embedding for NaN
+                // Check combined embedding for NaN (now fp32)
                 std::vector<float> acEmb(H);
-                GpuOps::halfToFloat(scratchEmbed_.as<__half>(), stagingEmbedsF32_.as<float>(), H, stream_);
                 cudaStreamSynchronize(stream_);
-                stagingEmbedsF32_.copyToHost(acEmb.data(), H * sizeof(float));
+                scratchEmbedF32_.copyToHost(acEmb.data(), H * sizeof(float));
                 float acNorm = 0;
                 int acNan = 0;
                 for (int i = 0; i < H; ++i) {
@@ -1299,12 +1414,11 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                 acNorm = sqrtf(acNorm);
 
                 // Single-frame audio stats
-                std::vector<float> sfAudioCpu(singleAudioLen);
-                singleAudioGpu.copyToHost(sfAudioCpu.data(), singleAudioLen * sizeof(float));
+                const auto& lastChunk = audioChunks.back();
                 float sfMin = 1e30f, sfMax = -1e30f;
-                for (int i = 0; i < singleAudioLen; ++i) {
-                    if (sfAudioCpu[i] < sfMin) sfMin = sfAudioCpu[i];
-                    if (sfAudioCpu[i] > sfMax) sfMax = sfAudioCpu[i];
+                for (int i = 0; i < hopLen; ++i) {
+                    if (lastChunk[i] < sfMin) sfMin = lastChunk[i];
+                    if (lastChunk[i] > sfMax) sfMax = lastChunk[i];
                 }
 
                 fprintf(dbgLog, "  diag[%d]: latNorm=%.4f dlNorm=%.4f acEmbNorm=%.4f acEmbNaN=%d frameAudio[%.4f,%.4f]\n",
@@ -1312,18 +1426,18 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                 fflush(dbgLog);
             }
 
-            // f. Feed next_embed to negative LM first (discard logits), then positive
+            // f. Feed next_embed (fp32) to negative LM first (discard logits), then positive
             // Sync between neg/pos: ensures TRT context, positionIdsBuf_, and
             // decodeMaskBuf_ are not reused while still in flight
             runLmDecodeWithLogits(lmDecode_, negLmKV_,
-                                  scratchEmbed_.as<__half>(), scratchHidden2_.as<__half>(),
-                                  negLogitsF32.as<float>(), negPos);
+                                  scratchEmbedF32_.as<float>(), scratchHidden2_.as<float>(),
+                                  loopNegLogitsF32_.as<float>(), negPos);
             negPos++;
             cudaStreamSynchronize(stream_);
 
             // Run positive decode last so its logits stay in stagingLogitsF32_
             runLmDecodeWithLogits(lmDecode_, lmKV_,
-                                  scratchEmbed_.as<__half>(), scratchHidden_.as<__half>(),
+                                  scratchEmbedF32_.as<float>(), scratchHidden_.as<float>(),
                                   stagingLogitsF32_.as<float>(), posPos);
             posPos++;
 
@@ -1351,9 +1465,11 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
         dbgLog = nullptr;
     }
 
-    // ── 12. Batch acoustic decode ──
+    // ── 12. Concatenate streaming audio chunks ──
+    // (Streaming decode already produced final audio during generation loop)
     int N = totalSpeechTokens;
-    LOG_INFO("TTS", "batch decoding %d latent frames -> %d audio samples", N, N * hopLen);
+    LOG_INFO("TTS", "concatenating %d streaming audio chunks (%d samples total)",
+             N, N * hopLen);
 
     if (N > 0) {
         // DIAG: Log denormalized latent stats
@@ -1371,33 +1487,15 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                      dMin, dMax, dSum / (N * 64), dNorm0);
         }
 
-        // Transpose from [N, 64] to [64, N]
-        std::vector<float> batchLatent(64 * N);
-        for (int t = 0; t < N; ++t) {
-            for (int d = 0; d < 64; ++d) {
-                batchLatent[d * N + t] = allDenormLatents[t * 64 + d];
-            }
+        // Concatenate all streaming audio chunks
+        result.audio.reserve(N * hopLen);
+        for (const auto& chunk : audioChunks) {
+            result.audio.insert(result.audio.end(), chunk.begin(), chunk.end());
         }
-
-        CudaBuffer batchLatentGpu;
-        batchLatentGpu.resize(64 * N * sizeof(float));
-        batchLatentGpu.copyFromHostAsync(batchLatent.data(), 64 * N * sizeof(float), stream_);
-
-        CudaBuffer batchAudioGpu;
-        batchAudioGpu.resize(1 * 1 * N * hopLen * sizeof(float));
-
-        acousticDecoder_.setInputShape("latent", nvinfer1::Dims3{1, 64, N});
-        acousticDecoder_.setTensorAddress("latent", batchLatentGpu.data());
-        acousticDecoder_.setTensorAddress("audio", batchAudioGpu.data());
-        acousticDecoder_.enqueueV3(stream_);
-
-        result.audio.resize(N * hopLen);
-        cudaStreamSynchronize(stream_);
-        batchAudioGpu.copyToHost(result.audio.data(), N * hopLen * sizeof(float));
 
         float aMin = *std::min_element(result.audio.begin(), result.audio.end());
         float aMax = *std::max_element(result.audio.begin(), result.audio.end());
-        LOG_INFO("TTS", "batch decoded audio [%d samples]: min=%.4f max=%.4f",
+        LOG_INFO("TTS", "streaming decoded audio [%d samples]: min=%.4f max=%.4f",
                  (int)result.audio.size(), aMin, aMax);
     }
 
@@ -1411,28 +1509,28 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
 // ── Diffusion sampling with CFG ──
 
 std::vector<float> TTSPipeline::sampleSpeechTokens(
-    const __half* posCondGpu, const __half* negCondGpu,
-    int hiddenSize, float cfgScale)
+    const float* posCondF32Gpu, const float* negCondF32Gpu,
+    int hiddenSize, float cfgScale, std::mt19937& rng)
 {
     int latentDim = meta_.diffusion.latent_size;  // 64
 
-    // 1. Generate random noise (fp32, CPU)
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    // 1. Generate random noise (fp32, CPU) using per-synthesis RNG
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
     std::vector<float> sample(latentDim);
     for (int i = 0; i < latentDim; ++i) {
-        sample[i] = dist(gen);
+        sample[i] = dist(rng);
     }
 
     // 2. Set up DPM solver
     dpm_.setTimesteps(cfg_.inferenceSteps);
 
     // 3. Prepare GPU condition buffer in fp32: [pos_cond, neg_cond] = [2, H]
-    // Convert fp16 hidden states -> fp32 for TRT engine
-    GpuOps::halfToFloat(posCondGpu, stagingCondF32_.as<float>(), hiddenSize, stream_);
-    GpuOps::halfToFloat(negCondGpu, stagingCondF32_.as<float>() + hiddenSize, hiddenSize, stream_);
+    // Hidden states are already fp32 — copy directly
+    cudaMemcpyAsync(stagingCondF32_.as<float>(), posCondF32Gpu,
+                    hiddenSize * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
+    cudaMemcpyAsync(stagingCondF32_.as<float>() + hiddenSize, negCondF32Gpu,
+                    hiddenSize * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
 
     // 4. Diffusion loop
     std::vector<float> vpredF32(2 * latentDim);
