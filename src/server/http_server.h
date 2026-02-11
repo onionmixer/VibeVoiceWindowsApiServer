@@ -12,7 +12,7 @@
 
 struct ServerConfig {
     std::string host = "0.0.0.0";
-    int port = 8080;
+    int port = 8899;
 
     // TTS models
     struct TTSModelConfig {

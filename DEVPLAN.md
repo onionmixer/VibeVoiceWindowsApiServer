@@ -385,7 +385,7 @@ public:
 
 ```json
 {
-    "server": { "host": "0.0.0.0", "port": 8080 },
+    "server": { "host": "0.0.0.0", "port": 8899 },
     "models": {
         "tts_0.5b": {
             "enabled": true,

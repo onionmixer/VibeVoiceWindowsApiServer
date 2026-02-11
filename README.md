@@ -305,7 +305,7 @@ Edit `config.json` to set server options and model paths.
 {
     "server": {
         "host": "0.0.0.0",
-        "port": 8080
+        "port": 8899
     },
     "models": {
         "tts_0.5b": {
@@ -354,7 +354,7 @@ Edit `config.json` to set server options and model paths.
 | Field | Description |
 |-------|-------------|
 | `server.host` | Listen address (`0.0.0.0` for all interfaces) |
-| `server.port` | Listen port (default: 8080) |
+| `server.port` | Listen port (default: 8899) |
 | `models.*.enabled` | Set `true` only for models with built TensorRT engines |
 | `models.*.engine_dir` | Path to directory containing `.trt` engine files |
 | `models.*.weights_dir` | Path to directory containing `.bin` weight files |
@@ -372,13 +372,30 @@ All paths are relative to the server executable's working directory, or can be a
 
 ## 6. Running the Server
 
-### Runtime PATH Setup
+### Runtime PATH Setup (Critical)
 
-Before running the server, ensure TensorRT and cuDNN DLLs are in PATH:
+> **주의**: TensorRT, cuDNN, CUDA 의 DLL 경로가 PATH에 포함되어 있지 않으면 서버가 **에러 메시지 없이 즉시 종료**됩니다. OS의 DLL 로더가 프로그램 진입 전에 실패하기 때문에 어떠한 로그도 남지 않습니다. 서버가 시작 직후 종료된다면 가장 먼저 PATH 설정을 확인하세요.
 
+**Command Prompt (cmd.exe)**:
 ```batch
 set PATH=C:\TensorRT\lib;C:\TensorRT\bin;C:\cudnn\bin;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin;%PATH%
 ```
+
+**PowerShell**:
+```powershell
+$env:PATH = "C:\TensorRT\lib;C:\TensorRT\bin;C:\cudnn\bin;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin;" + $env:PATH
+```
+
+> **참고**: `set PATH=...` 구문은 PowerShell에서 동작하지 않습니다. 반드시 `$env:PATH = ...` 형식을 사용하세요.
+
+필수 DLL 목록:
+
+| DLL | 제공 패키지 | PATH에 추가할 경로 |
+|-----|-------------|---------------------|
+| `nvinfer.dll`, `nvinfer_plugin.dll` | TensorRT | `%TENSORRT_ROOT%\lib` |
+| `trtexec.exe` | TensorRT | `%TENSORRT_ROOT%\bin` |
+| `cudnn64_8.dll` 등 | cuDNN | `%CUDNN_ROOT%\bin` |
+| `cudart64_12.dll`, `cublas64_12.dll` | CUDA Toolkit | CUDA 설치 시 자동 등록 (미등록 시 수동 추가) |
 
 ### Start
 
@@ -386,10 +403,21 @@ set PATH=C:\TensorRT\lib;C:\TensorRT\bin;C:\cudnn\bin;C:\Program Files\NVIDIA GP
 vibevoice_server.exe --config config.json
 ```
 
-The server will:
-1. Print CUDA/GPU info
-2. Load enabled TensorRT engines (takes ~10-15 seconds)
-3. Start listening on the configured host:port
+서버 시작 시 출력 예시:
+```
+=== VibeVoice Windows API Server ===
+CUDA Runtime: 12.8
+GPU [0]: NVIDIA GeForce RTX 3080 Ti (12287 MB)
+
+[INFO ] [TTS] model_type=tts_1.5b, hidden=1536, diffusion=yes
+[INFO ] [TOK] Tokenizer loaded: vocab=151665, merges=151387, added_tokens=22
+[INFO ] [TTS] loaded 6 TRT engines (1.5B)
+[INFO ] [TTS] found 9 voice WAV files
+[INFO ] [TTS] ready (9 voices available)
+[INFO ] [HTTP] listening on 0.0.0.0:8899
+```
+
+> **엔진 로딩 시간**: TensorRT 엔진 로드에 약 10~15초가 소요됩니다. `[HTTP] listening on ...` 메시지가 출력되기 전까지는 서버가 HTTP 요청을 수신하지 않습니다. 자동화 스크립트에서 서버를 시작할 경우, 20초 이상의 대기 시간을 두는 것을 권장합니다.
 
 ### CLI Options
 
@@ -402,14 +430,55 @@ Options:
   --test-e2e         Run end-to-end tests and exit
 ```
 
+### Network Access (Firewall)
+
+`config.json`에서 `server.host`가 `0.0.0.0`으로 설정된 경우, 서버는 모든 네트워크 인터페이스에서 접속을 수락합니다. 외부 기기에서 접근하려면:
+
+1. **Windows 방화벽**에서 서버 포트(기본 8899)에 대한 인바운드 규칙을 추가합니다:
+   ```batch
+   netsh advfirewall firewall add rule name="VibeVoice TTS" dir=in action=allow protocol=tcp localport=8899
+   ```
+2. 같은 네트워크의 다른 기기에서 `http://<서버IP>:8899/health` 로 접근합니다.
+3. `server.host`를 `127.0.0.1`로 변경하면 로컬 전용으로 제한됩니다.
+
 ### Quick Test
 
 ```batch
-curl -X POST http://localhost:8080/v1/audio/speech ^
+:: Health check (서버가 준비되었는지 확인)
+curl http://localhost:8899/health
+
+:: TTS 요청
+curl -X POST http://localhost:8899/v1/audio/speech ^
   -H "Content-Type: application/json" ^
   -d "{\"model\":\"vibevoice-1.5b\",\"input\":\"Hello, this is a test.\",\"voice\":\"en-Carter_man\",\"response_format\":\"wav\"}" ^
   --output test.wav
 ```
+
+### 제공되는 실행 스크립트
+
+프로젝트에 포함된 PowerShell 스크립트로 서버 시작과 테스트를 수행할 수 있습니다.
+
+| 스크립트 | 용도 |
+|----------|------|
+| `start_server.ps1` | 서버를 백그라운드 프로세스로 시작 (PATH 설정, 엔진 로딩 대기, 상태 확인 포함) |
+| `run_5tests_curl.ps1` | 5개 언어(영/일/중/한/혼합) TTS 테스트 실행 (서버 가동 상태에서 실행) |
+
+**서버 시작:**
+```powershell
+powershell -ExecutionPolicy Bypass -File start_server.ps1
+```
+
+**테스트 실행** (서버 가동 후 별도 터미널에서):
+```powershell
+powershell -ExecutionPolicy Bypass -File run_5tests_curl.ps1
+```
+
+**서버 종료:**
+```powershell
+Stop-Process -Name vibevoice_server -Force
+```
+
+> **참고**: `start_server.ps1`은 `Start-Process`를 사용하여 서버를 별도 프로세스로 실행합니다. PowerShell 창을 닫아도 서버는 유지됩니다. 스크립트 내의 DLL PATH 경로를 사용자 환경에 맞게 수정한 뒤 사용하세요.
 
 ---
 
@@ -564,6 +633,10 @@ VibeVoiceServer\
 ├── tools\
 │   └── ffmpeg.exe                Required for mp3/opus/aac/flac output
 │
+├── start_server.ps1              서버 시작 스크립트 (PowerShell)
+├── run_5tests_curl.ps1           5개 언어 TTS 테스트 스크립트
+├── test_en.json                  테스트 입력 데이터 (en/ja/zh/ko/mixed)
+│
 ├── onnx\                         ONNX models (intermediate, can be deleted after engine build)
 │   ├── tts_0.5b\
 │   └── tts_1.5b\
@@ -644,16 +717,39 @@ vibevoice_server.exe --config config.json
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| `nvinfer.dll not found` | Add `%TENSORRT_ROOT%\lib` to PATH |
-| `cudnn64_8.dll not found` | Add `%CUDNN_ROOT%\bin` to PATH |
-| `cudart64_12.dll not found` | Add CUDA bin directory to PATH |
-| `trtexec not found` | Set `TENSORRT_ROOT` environment variable |
-| `VIBEVOICE_LIB not set` | Set path to VibeVoice Python library before running export_onnx.py |
-| Engine build fails with OOM | Use `--no-fp16` or reduce max shapes; close other GPU applications |
-| Server starts but TTS returns error | Check `config.json` paths match actual file locations |
-| mp3/opus output fails | Place `ffmpeg.exe` in `tools/` directory |
+### 서버 시작 관련
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| 서버가 에러 메시지 없이 즉시 종료됨 | TensorRT/cuDNN/CUDA DLL이 PATH에 없음 | Section 6 "Runtime PATH Setup" 참조. `nvinfer.dll`, `cudnn64_8.dll` 등이 PATH에 포함되어야 합니다 |
+| `nvinfer.dll not found` | TensorRT lib 경로 누락 | `set PATH=%TENSORRT_ROOT%\lib;%PATH%` |
+| `cudnn64_8.dll not found` | cuDNN bin 경로 누락 | `set PATH=%CUDNN_ROOT%\bin;%PATH%` |
+| `cudart64_12.dll not found` | CUDA bin 경로 누락 | CUDA Toolkit 설치 확인 또는 수동으로 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin` 추가 |
+| 서버 시작 후 20초 내에 HTTP 요청 실패 | 엔진 로딩 중 | `[HTTP] listening on ...` 로그가 출력될 때까지 대기 (약 10~15초) |
+| PowerShell에서 `set PATH=...` 가 동작하지 않음 | PowerShell은 `set` 명령어를 사용하지 않음 | `$env:PATH = "...;" + $env:PATH` 형식 사용 |
+
+### 네트워크 관련
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| 로컬에서는 접속되지만 외부에서 접속 불가 | Windows 방화벽이 포트 차단 | `netsh advfirewall firewall add rule name="VibeVoice TTS" dir=in action=allow protocol=tcp localport=8899` |
+| 같은 PC에서만 접속하고 싶음 | 기본값이 0.0.0.0 (모든 인터페이스) | `config.json`에서 `server.host`를 `127.0.0.1`로 변경 |
+
+### 모델 변환 관련
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| `trtexec not found` | TENSORRT_ROOT 미설정 | `set TENSORRT_ROOT=C:\TensorRT` |
+| `VIBEVOICE_LIB not set` | VibeVoice Python 라이브러리 경로 미설정 | `set VIBEVOICE_LIB=C:\path\to\VibeVoice` |
+| Engine build fails with OOM | GPU 메모리 부족 | `--no-fp16` 사용 또는 다른 GPU 프로그램 종료 |
+
+### 추론 관련
+
+| 증상 | 원인 | 해결 |
+|------|------|------|
+| TTS 요청 시 에러 응답 | `config.json` 경로가 실제 파일과 불일치 | engine_dir, weights_dir, metadata_path, voices_dir 경로 확인 |
+| mp3/opus/aac/flac 출력 실패 | ffmpeg.exe 누락 | `tools/ffmpeg.exe` 배치 |
+| 두 모델 동시 로드 시 VRAM 부족 | GPU 메모리 한계 | 한 모델만 `enabled: true`로 설정하거나 VRAM이 큰 GPU 사용 |
 
 ## License
 
