@@ -170,6 +170,48 @@ __global__ void floatToHalfKernel(const float* input, __half* output, int n) {
     output[i] = __float2half(input[i]);
 }
 
+// ── FP32 kernels for connector pipeline ──
+
+__global__ void vectorAddF32Kernel(const float* a, const float* b, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    output[i] = a[i] + b[i];
+}
+
+__global__ void addBiasF32Kernel(const float* bias, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    output[i] += bias[i];
+}
+
+__global__ void rmsNormF32Kernel(const float* input, const float* weight,
+                                  float* output, int n, float eps) {
+    extern __shared__ float sharedMem[];
+
+    float localSum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float val = input[i];
+        localSum += val * val;
+    }
+
+    sharedMem[threadIdx.x] = localSum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sharedMem[threadIdx.x] += sharedMem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    float rms = sqrtf(sharedMem[0] / (float)n + eps);
+    float invRms = 1.0f / rms;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        output[i] = input[i] * invRms * weight[i];
+    }
+}
+
 // ── Namespace implementation ──
 
 namespace GpuOps {
@@ -314,6 +356,52 @@ void halfToFloat(const __half* input, float* output, int n, cudaStream_t stream)
 
 void floatToHalf(const float* input, __half* output, int n, cudaStream_t stream) {
     floatToHalfKernel<<<gridSize(n), kBlockSize, 0, stream>>>(input, output, n);
+}
+
+// ── FP32 connector operations (matching Python reference precision) ──
+
+void linearForwardF32(cublasHandle_t cublas, const float* input,
+                      const float* weight, const float* bias,
+                      float* output, int N, int K, cudaStream_t stream) {
+    // output[1,N] = input[1,K] @ weight[N,K]^T  (all fp32)
+    // Same logic as fp16 version but using cublasSgemm
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    cublasSetStream(cublas, stream);
+
+    // weight is [N, K] in row-major = [K, N] in column-major
+    // C(N,1) = A(N,K) * B(K,1) in col-major: A stored as (K,N) with transpose
+    cublasSgemm(cublas,
+                CUBLAS_OP_T,    // A (weight) transposed
+                CUBLAS_OP_N,    // B (input) not transposed
+                N, 1, K,
+                &alpha,
+                weight, K,      // lda = K
+                input, K,       // ldb = K
+                &beta,
+                output, N);     // ldc = N
+
+    if (bias) {
+        int blocks = gridSize(N);
+        addBiasF32Kernel<<<blocks, kBlockSize, 0, stream>>>(bias, output, N);
+    }
+}
+
+void rmsNormF32(const float* input, const float* weight, float* output,
+                int n, float eps, cudaStream_t stream) {
+    int threads = (n < 1024) ? n : 1024;
+    int reducThreads = 1;
+    while (reducThreads < threads) reducThreads <<= 1;
+    if (reducThreads > 1024) reducThreads = 1024;
+
+    size_t sharedSize = reducThreads * sizeof(float);
+    rmsNormF32Kernel<<<1, reducThreads, sharedSize, stream>>>(input, weight, output, n, eps);
+}
+
+void vectorAddF32(const float* a, const float* b, float* output,
+                  int n, cudaStream_t stream) {
+    vectorAddF32Kernel<<<gridSize(n), kBlockSize, 0, stream>>>(a, b, output, n);
 }
 
 } // namespace GpuOps

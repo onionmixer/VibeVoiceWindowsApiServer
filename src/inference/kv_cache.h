@@ -11,8 +11,8 @@ public:
     KVCache& operator=(KVCache&&) = default;
 
     // Allocate double-buffered GPU memory for all layers
-    // useFp16=true: allocate fp16 buffers (for 1.5B FP16 ONNX engines)
-    // useFp16=false: allocate fp32 buffers (for 0.5B FP32 ONNX engines)
+    // useFp16=false: allocate fp32 buffers (default for 1.5B FP32 and 0.5B engines)
+    // useFp16=true: allocate fp16 buffers (legacy, not used for 1.5B)
     bool init(int numLayers, int numKVHeads, int headDim, int maxSeqLen, bool useFp16 = false);
 
     // Load pre-computed KV-cache from VoicePresetGroup
@@ -47,8 +47,8 @@ private:
     int bufIdx_ = 0; // 0 or 1
     bool fp16_ = false;
 
-    // keys_[layer * 2 + bufIdx]: CudaBuffer sized [1, numKVHeads, maxSeqLen, headDim] fp16
-    // Note: TRT engines have fp16 KV I/O (ONNX exported in fp16 for proper norm precision)
+    // keys_[layer * 2 + bufIdx]: CudaBuffer sized [1, numKVHeads, maxSeqLen, headDim]
+    // Precision depends on useFp16 flag: fp32 for 1.5B (default), fp16 for legacy
     std::vector<CudaBuffer> keys_;   // [numLayers * 2]
     std::vector<CudaBuffer> values_; // [numLayers * 2]
 };

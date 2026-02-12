@@ -1,1 +1,1 @@
-{"model":"vibevoice-1.5b","input":"Hello, 안녕하세요! Today we will learn about AI, 人工知能について学びましょう。","voice":"en-Carter_man","response_format":"wav"}
+{"model":"tts-1-hd","input":"Hello 你好 こんにちは 안녕하세요, welcome to the multilingual test.","voice":"en-Carter_man","response_format":"wav","speed":1.0}

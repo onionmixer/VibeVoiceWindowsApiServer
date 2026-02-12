@@ -6,6 +6,9 @@ Exports 5 sub-models (acoustic_encoder, acoustic_decoder, semantic_encoder,
 language_model, diffusion_head) from safetensors weights to individual ONNX files.
 Connector weights (small MLPs) are saved as raw binary for C++ direct implementation.
 
+Precision: Language model is exported in FP32 by default for quality parity with
+the Python reference server. Audio components use their native precision.
+
 Usage:
     python scripts/export_onnx.py --model-dir <path> --model-type <tts_1.5b|tts_0.5b|asr> --output-dir onnx/<variant>
 
@@ -597,13 +600,13 @@ def export_language_model_full(model, output_dir, model_type, config):
     print(f"  LM config: H={hidden_size}, L={num_layers}, KV_heads={num_kv_heads}, "
           f"head_dim={head_dim}, V={vocab_size}")
 
-    # Convert language model to FP16 on CUDA for export.
-    # This ensures RMS norm Cast(FP16->FP32) nodes are meaningful in the ONNX graph,
-    # so TRT will preserve them when building with --fp16 (preventing precision loss).
+    # Keep language model in FP32 for ONNX export.
+    # FP32 ONNX allows TRT to choose mixed precision (FP16 where safe, FP32 where needed).
+    # This gives better precision than all-FP16, matching Python BF16 inference behavior.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    language_model = language_model.half().to(device)
-    lm_head = lm_head.half().to(device)
-    print(f"  LM converted to FP16 on {device} for ONNX export")
+    language_model = language_model.float().to(device)
+    lm_head = lm_head.float().to(device)
+    print(f"  LM kept in FP32 on {device} for ONNX export")
 
     # --- Prefill ---
     print(f"\n  Exporting prefill...")
@@ -611,7 +614,7 @@ def export_language_model_full(model, output_dir, model_type, config):
     prefill_wrapper.eval()
 
     seq_len = 16
-    dummy_embeds = torch.randn(1, seq_len, hidden_size, dtype=torch.float16, device=device)
+    dummy_embeds = torch.randn(1, seq_len, hidden_size, dtype=torch.float32, device=device)
     dummy_pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
     # 4D causal attention mask [1, 1, S, S]: 0.0 = attend, -3.4e38 = block
@@ -644,7 +647,7 @@ def export_language_model_full(model, output_dir, model_type, config):
     decode_wrapper.eval()
 
     past_seq_len = 16
-    dummy_embeds_1 = torch.randn(1, 1, hidden_size, dtype=torch.float16, device=device)
+    dummy_embeds_1 = torch.randn(1, 1, hidden_size, dtype=torch.float32, device=device)
     dummy_pos_ids_1 = torch.tensor([[past_seq_len]], device=device)
 
     # 4D decode attention mask [1, 1, 1, total_seq]: all 0.0 (attend to all past + current)
@@ -652,11 +655,11 @@ def export_language_model_full(model, output_dir, model_type, config):
     total_seq = past_seq_len + 1
     dummy_decode_mask = torch.zeros(1, 1, 1, total_seq, dtype=torch.float32, device=device)
 
-    # Create dummy past KV cache in FP16 (matching model dtype)
+    # Create dummy past KV cache in FP32 (matching model dtype)
     dummy_past_kv = []
     for _ in range(num_layers):
-        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim, dtype=torch.float16, device=device))  # key
-        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim, dtype=torch.float16, device=device))  # value
+        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim, dtype=torch.float32, device=device))  # key
+        dummy_past_kv.append(torch.randn(1, num_kv_heads, past_seq_len, head_dim, dtype=torch.float32, device=device))  # value
 
     kv_in_names = get_lm_kv_names(num_layers)
     kv_present_names = get_present_kv_names(num_layers)

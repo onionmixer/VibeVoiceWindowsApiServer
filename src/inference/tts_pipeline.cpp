@@ -261,6 +261,65 @@ bool TTSPipeline::load(const Config& cfg) {
         LOG_INFO("TTS", "allocated 1.5B scratch: vocab=%d, semDim=%d", vocabSize, semDim);
     }
 
+    // Warm up streaming TRT engines with non-zero inputs (multiple iterations)
+    // The streaming acoustic decoder requires 3+ warm-up iterations with non-zero data
+    // to properly initialize its internal convolutional cache state.
+    // Without this, the first real request produces near-zero audio output.
+    if (type_ == ModelType::FULL_1_5B && streamingAcDecoder_.isLoaded()) {
+        int latentDim = meta_.diffusion.latent_size;
+        int hopLen = meta_.hop_length > 0 ? meta_.hop_length : 3200;
+        int semDim = meta_.semantic_vae_dim > 0 ? meta_.semantic_vae_dim : 128;
+        int warmupIters = 5;
+
+        CudaBuffer warmLatGpu, warmCacheInGpu, warmCacheOutGpu, warmAudioGpu;
+        warmLatGpu.resize(latentDim * sizeof(float));
+        warmCacheInGpu.resize(acDecCacheSize_ * sizeof(float));
+        warmCacheOutGpu.resize(acDecCacheSize_ * sizeof(float));
+        warmAudioGpu.resize(hopLen * sizeof(float));
+
+        // Fill latent with small non-zero values (simulates typical denormalized latent magnitude)
+        std::vector<float> warmLatCpu(latentDim, 1.0f);
+        warmLatGpu.copyFromHost(warmLatCpu.data(), latentDim * sizeof(float));
+        cudaMemsetAsync(warmCacheInGpu.data(), 0, acDecCacheSize_ * sizeof(float), stream_);
+
+        streamingAcDecoder_.setInputShape("latent", nvinfer1::Dims3{1, latentDim, 1});
+        nvinfer1::Dims2 warmAcCacheDims{1, acDecCacheSize_};
+        streamingAcDecoder_.setInputShape("cache_in", warmAcCacheDims);
+
+        for (int w = 0; w < warmupIters; ++w) {
+            streamingAcDecoder_.setTensorAddress("latent", warmLatGpu.data());
+            streamingAcDecoder_.setTensorAddress("cache_in", warmCacheInGpu.data());
+            streamingAcDecoder_.setTensorAddress("audio", warmAudioGpu.data());
+            streamingAcDecoder_.setTensorAddress("cache_out", warmCacheOutGpu.data());
+            streamingAcDecoder_.enqueueV3(stream_);
+            cudaStreamSynchronize(stream_);
+            std::swap(warmCacheInGpu, warmCacheOutGpu);
+        }
+
+        // Warm up streaming semantic encoder (use decoder's audio output as input)
+        CudaBuffer warmSemCacheInGpu, warmSemCacheOutGpu, warmSemOutGpu;
+        warmSemCacheInGpu.resize(semCacheSize_ * sizeof(float));
+        warmSemCacheOutGpu.resize(semCacheSize_ * sizeof(float));
+        warmSemOutGpu.resize(semDim * sizeof(float));
+        cudaMemsetAsync(warmSemCacheInGpu.data(), 0, semCacheSize_ * sizeof(float), stream_);
+
+        streamingSemEncoder_.setInputShape("audio", nvinfer1::Dims3{1, 1, hopLen});
+        nvinfer1::Dims2 warmSemCacheDims{1, semCacheSize_};
+        streamingSemEncoder_.setInputShape("cache_in", warmSemCacheDims);
+
+        for (int w = 0; w < warmupIters; ++w) {
+            streamingSemEncoder_.setTensorAddress("audio", warmAudioGpu.data());
+            streamingSemEncoder_.setTensorAddress("cache_in", warmSemCacheInGpu.data());
+            streamingSemEncoder_.setTensorAddress("semantic_mean", warmSemOutGpu.data());
+            streamingSemEncoder_.setTensorAddress("cache_out", warmSemCacheOutGpu.data());
+            streamingSemEncoder_.enqueueV3(stream_);
+            cudaStreamSynchronize(stream_);
+            std::swap(warmSemCacheInGpu, warmSemCacheOutGpu);
+        }
+
+        LOG_INFO("TTS", "streaming engines warmed up (%d iterations each)", warmupIters);
+    }
+
     loaded_ = true;
     LOG_INFO("TTS", "ready (%zu voices available)", availableVoices().size());
     return true;
@@ -311,7 +370,7 @@ bool TTSPipeline::loadWeights() {
     }
 
     if (type_ == ModelType::FULL_1_5B) {
-        // Semantic connector
+        // Semantic connector (fp16)
         ConnectorWeights semConn;
         if (!loadConnectorWeights(dir + "semantic_connector.bin", semConn)) return false;
         semConnInputDim_ = semConn.input_dim;
@@ -323,6 +382,41 @@ bool TTSPipeline::loadWeights() {
         if (!semanticConnFc2B_.upload(semConn.fc2_bias)) return false;
         LOG_INFO("TTS", "semantic_connector [%u -> %u] uploaded",
                  semConn.input_dim, semConn.output_dim);
+
+        // Convert acoustic connector weights to FP32 (matching Python precision)
+        // acoustic_connector: fc1 [outputDim, inputDim], fc1_bias [outputDim], norm [outputDim],
+        //                     fc2 [outputDim, outputDim], fc2_bias [outputDim]
+        int inD = connInputDim_, outD = connOutputDim_;
+        connFc1WF32_.resize(outD * inD * sizeof(float));
+        connFc1BF32_.resize(outD * sizeof(float));
+        connNormWF32_.resize(outD * sizeof(float));
+        connFc2WF32_.resize(outD * outD * sizeof(float));
+        connFc2BF32_.resize(outD * sizeof(float));
+        GpuOps::halfToFloat(connFc1W_.as<__half>(), connFc1WF32_.as<float>(), outD * inD, stream_);
+        GpuOps::halfToFloat(connFc1B_.as<__half>(), connFc1BF32_.as<float>(), outD, stream_);
+        GpuOps::halfToFloat(connNormW_.as<__half>(), connNormWF32_.as<float>(), outD, stream_);
+        GpuOps::halfToFloat(connFc2W_.as<__half>(), connFc2WF32_.as<float>(), outD * outD, stream_);
+        GpuOps::halfToFloat(connFc2B_.as<__half>(), connFc2BF32_.as<float>(), outD, stream_);
+        LOG_INFO("TTS", "acoustic_connector FP32 weights converted [%d -> %d]", inD, outD);
+
+        // Convert semantic connector weights to FP32
+        int sInD = semConnInputDim_, sOutD = semConnOutputDim_;
+        semanticConnFc1WF32_.resize(sOutD * sInD * sizeof(float));
+        semanticConnFc1BF32_.resize(sOutD * sizeof(float));
+        semanticConnNormWF32_.resize(sOutD * sizeof(float));
+        semanticConnFc2WF32_.resize(sOutD * sOutD * sizeof(float));
+        semanticConnFc2BF32_.resize(sOutD * sizeof(float));
+        GpuOps::halfToFloat(semanticConnFc1W_.as<__half>(), semanticConnFc1WF32_.as<float>(), sOutD * sInD, stream_);
+        GpuOps::halfToFloat(semanticConnFc1B_.as<__half>(), semanticConnFc1BF32_.as<float>(), sOutD, stream_);
+        GpuOps::halfToFloat(semanticConnNormW_.as<__half>(), semanticConnNormWF32_.as<float>(), sOutD, stream_);
+        GpuOps::halfToFloat(semanticConnFc2W_.as<__half>(), semanticConnFc2WF32_.as<float>(), sOutD * sOutD, stream_);
+        GpuOps::halfToFloat(semanticConnFc2B_.as<__half>(), semanticConnFc2BF32_.as<float>(), sOutD, stream_);
+        cudaStreamSynchronize(stream_);
+        LOG_INFO("TTS", "semantic_connector FP32 weights converted [%d -> %d]", sInD, sOutD);
+
+        // Allocate FP32 connector scratch buffer
+        int maxOutD = std::max(outD, sOutD);
+        connScratchF32_.resize(maxOutD * sizeof(float));
     }
 
     return true;
@@ -960,7 +1054,7 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
         voiceLatentCpu[i] = (voiceLatentCpu[i] + speechBiasFactor_) * speechScalingFactor_;
     }
 
-    // Run acoustic connector for each frame
+    // Run acoustic connector for each frame (FP16 compute)
     std::vector<float> voiceEmbedsCpu(voiceLatentFrames * H);
     for (int t = 0; t < voiceLatentFrames; ++t) {
         // Upload normalized latent [64] as fp16
@@ -1311,9 +1405,9 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
             allDenormLatents.insert(allDenormLatents.end(), denormLatent.begin(), denormLatent.end());
             totalSpeechTokens++;
 
-            // e. Compute next_embed = acoustic_embed + semantic_embed
+            // e. Compute next_embed = acoustic_embed + semantic_embed (FP16 connectors)
 
-            // e1. acoustic_connector: normalized latent [64] -> [H]
+            // e1. acoustic_connector: normalized latent [64] -> [H] (FP16)
             scratchLatentF32_.copyFromHost(latent.data(), latentDim * sizeof(float));
             GpuOps::floatToHalf(scratchLatentF32_.as<float>(), scratchLatent_.as<__half>(),
                                 latentDim, stream_);
@@ -1370,25 +1464,23 @@ TTSPipeline::Result TTSPipeline::synth15B(const Request& req) {
                 fflush(dbgLog);
             }
 
-            // e4. semantic_connector: features [1,1,semDim] -> [H]
-            // Output from streaming encoder is [1, 1, semDim] (batch, time=1, features)
-            // Copy semantic output to staging buffer and convert to fp16 for connector
+            // e4. semantic_connector: features [semDim] -> [H] (FP16)
+            // Output from streaming encoder is [1, 1, semDim] — copy to staging, convert to fp16
             cudaStreamSynchronize(stream_);
             cudaMemcpyAsync(loopSemFrameGpu_.data(), loopSemOutGpu_.data(),
                             semDim * sizeof(float), cudaMemcpyDeviceToDevice, stream_);
-            GpuOps::floatToHalf(loopSemFrameGpu_.as<float>(), loopSemLatFp16_.as<__half>(), semDim, stream_);
+            GpuOps::floatToHalf(loopSemFrameGpu_.as<float>(), loopSemLatFp16_.as<__half>(),
+                                semDim, stream_);
 
             runConnector(loopSemLatFp16_.as<__half>(), scratchSemanticEmbed_.as<__half>(),
                          semanticConnFc1W_, semanticConnFc1B_, semanticConnNormW_,
                          semanticConnFc2W_, semanticConnFc2B_,
                          semConnInputDim_, semConnOutputDim_);
 
-            // e5. next_embed = acoustic_embed + semantic_embed
-            // No blending needed — streaming cache ensures smooth temporal continuity
+            // e5. next_embed = acoustic_embed + semantic_embed (FP16 add, then convert to FP32)
             GpuOps::vectorAdd(scratchEmbed_.as<__half>(), scratchSemanticEmbed_.as<__half>(),
                               scratchEmbed_.as<__half>(), H, stream_);
-
-            // e6. Convert combined fp16 embedding to fp32 for LM input
+            // Convert combined fp16 embedding to fp32 for LM input
             GpuOps::halfToFloat(scratchEmbed_.as<__half>(), scratchEmbedF32_.as<float>(), H, stream_);
 
             // Diagnostic: log intermediate values
@@ -1602,6 +1694,29 @@ void TTSPipeline::runConnector(const __half* latentGpu, __half* outputGpu,
     GpuOps::linearForward(cublas_, connScratch_.as<__half>(),
                           fc2W.as<__half>(), fc2B.as<__half>(),
                           outputGpu, outputDim, outputDim, stream_);
+}
+
+// ── FP32 Connector (matching Python precision for 1.5B feedback loop) ──
+
+void TTSPipeline::runConnectorF32(const float* latentGpu, float* outputGpu,
+                                   const CudaBuffer& fc1W, const CudaBuffer& fc1B,
+                                   const CudaBuffer& normW,
+                                   const CudaBuffer& fc2W, const CudaBuffer& fc2B,
+                                   int inputDim, int outputDim) {
+    // fc1: [inputDim] -> [outputDim]
+    GpuOps::linearForwardF32(cublas_, latentGpu,
+                             fc1W.as<float>(), fc1B.as<float>(),
+                             connScratchF32_.as<float>(), outputDim, inputDim, stream_);
+
+    // RMSNorm
+    GpuOps::rmsNormF32(connScratchF32_.as<float>(), normW.as<float>(),
+                       connScratchF32_.as<float>(), outputDim,
+                       (float)meta_.rms_norm_eps, stream_);
+
+    // fc2: [outputDim] -> [outputDim]
+    GpuOps::linearForwardF32(cublas_, connScratchF32_.as<float>(),
+                             fc2W.as<float>(), fc2B.as<float>(),
+                             outputGpu, outputDim, outputDim, stream_);
 }
 
 // ── EOS Classifier ──

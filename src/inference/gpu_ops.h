@@ -63,6 +63,20 @@ void linearForwardBatch(cublasHandle_t cublas, const __half* A,
 void rmsNormBatched(const __half* input, const __half* weight, __half* output,
                     int M, int N, float eps, cudaStream_t stream);
 
+// FP32 variants for connector pipeline (matching Python reference precision)
+// Linear: output = input @ weight^T + bias  (all fp32)
+void linearForwardF32(cublasHandle_t cublas, const float* input,
+                      const float* weight, const float* bias,
+                      float* output, int N, int K, cudaStream_t stream);
+
+// RMSNorm: output = normalize(input) * weight  (all fp32)
+void rmsNormF32(const float* input, const float* weight, float* output,
+                int n, float eps, cudaStream_t stream);
+
+// Vector add: output = a + b  (all fp32)
+void vectorAddF32(const float* a, const float* b, float* output,
+                  int n, cudaStream_t stream);
+
 // fp16 <-> fp32 conversion
 void halfToFloat(const __half* input, float* output, int n, cudaStream_t stream);
 void floatToHalf(const float* input, __half* output, int n, cudaStream_t stream);

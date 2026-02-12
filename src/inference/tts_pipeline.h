@@ -66,12 +66,19 @@ private:
         const float* posCondF32Gpu, const float* negCondF32Gpu,
         int hiddenSize, float cfgScale, std::mt19937& rng);
 
-    // SpeechConnector: latent[64] -> embed[hidden_size] on GPU
+    // SpeechConnector: latent[64] -> embed[hidden_size] on GPU (FP16 — used by 0.5B)
     void runConnector(const __half* latentGpu, __half* outputGpu,
                       const CudaBuffer& fc1W, const CudaBuffer& fc1B,
                       const CudaBuffer& normW,
                       const CudaBuffer& fc2W, const CudaBuffer& fc2B,
                       int inputDim, int outputDim);
+
+    // SpeechConnector FP32: latent[64] fp32 -> embed[hidden_size] fp32 (matching Python precision)
+    void runConnectorF32(const float* latentGpu, float* outputGpu,
+                         const CudaBuffer& fc1W, const CudaBuffer& fc1B,
+                         const CudaBuffer& normW,
+                         const CudaBuffer& fc2W, const CudaBuffer& fc2B,
+                         int inputDim, int outputDim);
 
     // EOS classifier: hidden[hidden_size] -> sigmoid score
     float runEosClassifier(const __half* hiddenGpu);
@@ -154,13 +161,20 @@ private:
     // GPU weight buffers
     CudaBuffer embedTokensGpu_;                   // [vocab_size, hidden_size] fp16
     CudaBuffer ttsInputTypesGpu_;                  // 0.5B: [2, hidden_size] fp16
-    CudaBuffer connFc1W_, connFc1B_, connNormW_;   // connector weights
+    CudaBuffer connFc1W_, connFc1B_, connNormW_;   // connector weights (fp16 — 0.5B)
     CudaBuffer connFc2W_, connFc2B_;
     CudaBuffer eosFc1W_, eosFc1B_;                 // 0.5B: EOS classifier
     CudaBuffer eosFc2W_, eosFc2B_;
-    CudaBuffer semanticConnFc1W_, semanticConnFc1B_; // 1.5B: semantic connector
+    CudaBuffer semanticConnFc1W_, semanticConnFc1B_; // 1.5B: semantic connector (fp16 — 0.5B)
     CudaBuffer semanticConnNormW_;
     CudaBuffer semanticConnFc2W_, semanticConnFc2B_;
+
+    // FP32 connector weights (1.5B only — converted from fp16 at load time for Python-matching precision)
+    CudaBuffer connFc1WF32_, connFc1BF32_, connNormWF32_;
+    CudaBuffer connFc2WF32_, connFc2BF32_;
+    CudaBuffer semanticConnFc1WF32_, semanticConnFc1BF32_;
+    CudaBuffer semanticConnNormWF32_;
+    CudaBuffer semanticConnFc2WF32_, semanticConnFc2BF32_;
 
     float speechScalingFactor_ = 0.0f;
     float speechBiasFactor_ = 0.0f;
@@ -202,7 +216,8 @@ private:
     CudaBuffer scratchTimesteps_;  // [2] int32
     CudaBuffer positionIdsBuf_;    // [1, 1] int32
     CudaBuffer inputIdBuf_;        // [1] int32
-    CudaBuffer connScratch_;       // [1, outputDim] fp16 (connector intermediate)
+    CudaBuffer connScratch_;       // [1, outputDim] fp16 (connector intermediate — 0.5B)
+    CudaBuffer connScratchF32_;    // [1, outputDim] fp32 (connector intermediate — 1.5B)
 
     // fp32 staging buffers for TRT engine I/O
     // (0.5B engines have fp32 I/O; 1.5B uses fp16 embeds/hidden but fp32 logits/mask)

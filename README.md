@@ -763,6 +763,38 @@ vibevoice_server.exe --config config.json
 | mp3/opus/aac/flac 출력 실패 | ffmpeg.exe 누락 | `tools/ffmpeg.exe` 배치 |
 | 두 모델 동시 로드 시 VRAM 부족 | GPU 메모리 한계 | 한 모델만 `enabled: true`로 설정하거나 VRAM이 큰 GPU 사용 |
 
+## Quality Status
+
+### 0.5B Streaming TTS
+
+- 동작 안정 (연속 10+ 요청 검증)
+- Python 레퍼런스와 유사한 오디오 품질
+- 스트리밍 acoustic decoder (캐시 기반) 및 text-based maxSpeechTokens 지원
+
+### 1.5B Full TTS
+
+**현재 상태: 실험적 (Experimental)**
+
+1.5B 모델은 오디오를 생성하지만, Python 레퍼런스 대비 출력 품질이 불안정합니다.
+
+| 항목 | 상태 |
+|------|------|
+| 오디오 생성 | 동작 (WAV 파일 정상 생성) |
+| 음성 길이 | Python 대비 85~123% 범위 |
+| 음성 품질 | 불안정 — 텍스트 내용과 무관한 음성이 생성될 수 있음 |
+| 멀티 리퀘스트 | 첫 번째 요청이 실패할 수 있음 (TRT 엔진 워밍업 이슈) |
+| CFG | cfg_scale=1.5 (기본값) |
+
+**알려진 이슈:**
+
+- **TensorRT 스트리밍 엔진 워밍업**: 서버 시작 후 첫 번째 요청에서 streaming acoustic decoder가 zero 출력을 생성할 수 있습니다. 두 번째 이후 요청에서는 정상 동작합니다. 로드 시 워밍업 실행으로 부분 완화됨.
+- **FP16 커넥터 정밀도**: Acoustic/semantic connector가 FP16으로 실행되어 Python (FP32) 대비 약간의 수치 차이가 있습니다. Autoregressive 피드백 루프에서 누적될 수 있습니다.
+- **DPM-Solver 확률적 특성**: Diffusion 샘플링에 랜덤 노이즈를 사용하므로 동일 입력에서도 매번 다른 결과가 생성됩니다.
+
+### ASR (Speech-to-Text)
+
+코드 구현 완료, TensorRT 엔진 미빌드 상태.
+
 ## License
 
 Proprietary. All rights reserved.

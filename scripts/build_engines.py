@@ -226,6 +226,14 @@ def get_shape_profiles(model_type: str, metadata: dict):
             )
         profiles["language_model_decode"] = decode_shapes
 
+    # Streaming semantic encoder: fully static shapes (no dynamic axes in ONNX)
+    if model_type != "tts_0.5b":
+        profiles["streaming_semantic_encoder"] = {}  # static — no shape profiles needed
+
+    # Streaming acoustic decoder: fully static shapes (no dynamic axes in ONNX)
+    if model_type != "asr":
+        profiles["streaming_acoustic_decoder"] = {}  # static — no shape profiles needed
+
     return profiles
 
 
@@ -240,12 +248,12 @@ def main():
         help="Output directory for TensorRT engine files",
     )
     parser.add_argument(
-        "--fp16", action="store_true", default=True,
-        help="Enable FP16 precision (default: True)",
+        "--fp16", action="store_true", default=False,
+        help="Enable FP16 precision (default: False, FP32 is default for quality)",
     )
     parser.add_argument(
         "--no-fp16", action="store_true",
-        help="Disable FP16 precision",
+        help="Explicitly disable FP16 precision (same as default)",
     )
     parser.add_argument(
         "--only", type=str, default=None,
@@ -268,6 +276,8 @@ def main():
 
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
+
+    metadata["_metadata_path"] = metadata_path  # for cache JSON path resolution
 
     model_type = metadata["model_type"]
     print(f"Model type: {model_type}")
